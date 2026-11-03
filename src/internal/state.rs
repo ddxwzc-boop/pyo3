@@ -6,6 +6,10 @@ use crate::{ffi, Python};
 
 use std::cell::Cell;
 #[cfg(not(pyo3_disable_reference_pool))]
+use std::cell::RefCell;
+#[cfg(not(pyo3_disable_reference_pool))]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(not(pyo3_disable_reference_pool))]
 use std::sync::OnceLock;
 #[cfg_attr(pyo3_disable_reference_pool, allow(unused_imports))]
 use std::{mem, ptr::NonNull, sync};
@@ -167,7 +171,6 @@ impl Drop for AttachGuard {
         match self {
             AttachGuard::Assumed => {}
             AttachGuard::Ensured { gstate } => unsafe {
-                // Drop the objects in the pool before attempting to release the thread state
                 ffi::PyGILState_Release(*gstate);
             },
         }
@@ -178,10 +181,84 @@ impl Drop for AttachGuard {
 #[cfg(not(pyo3_disable_reference_pool))]
 type PyObjVec = Vec<NonNull<ffi::PyObject>>;
 
+/// Number of pending decrefs which a thread will buffer in thread-local storage
+/// before flushing them into the global pool.
+///
+/// This amortizes the cost of the global pool's mutex: threads dropping `Py`
+/// handles while detached take the mutex once per [`TLS_PENDING_DECREFS_CAPACITY`]
+/// drops instead of once per drop.
 #[cfg(not(pyo3_disable_reference_pool))]
-/// Thread-safe storage for objects which were dec_ref while not attached.
+const TLS_PENDING_DECREFS_CAPACITY: usize = 64;
+
+/// Wrapper type for the thread-local buffer of pending decrefs, so that a thread
+/// which exits with buffered decrefs flushes them to the global pool (raw
+/// pointers do not decref themselves, so the references would otherwise be
+/// leaked).
+#[cfg(not(pyo3_disable_reference_pool))]
+struct TlsPendingDecrefs(PyObjVec);
+
+#[cfg(not(pyo3_disable_reference_pool))]
+impl TlsPendingDecrefs {
+    /// Takes the buffered objects out, leaving the buffer empty (and thereby its
+    /// `Drop`, which flushes non-empty buffers, a no-op).
+    fn take(&mut self) -> PyObjVec {
+        mem::take(&mut self.0)
+    }
+}
+
+#[cfg(not(pyo3_disable_reference_pool))]
+impl Drop for TlsPendingDecrefs {
+    fn drop(&mut self) {
+        flush_pending_decrefs(&mut self.0);
+    }
+}
+
+#[cfg(not(pyo3_disable_reference_pool))]
+thread_local! {
+    /// Buffer for decrefs pending on this thread, which avoids taking the global
+    /// pool's mutex for every `Py` dropped while detached.
+    ///
+    /// The buffer is flushed to the global pool when it fills up, when the thread
+    /// drains (i.e. on attach and at the end of detach), and when the thread exits.
+    ///
+    /// The buffer's allocation is retained across drains (up to the largest batch
+    /// it has ever held) to avoid allocator churn; it is never shrunk.
+    ///
+    /// On wasm targets built without atomics (which have no threads), thread-exit
+    /// destructors do not run, so a residual buffer at process end is simply
+    /// abandoned (bounded by `TLS_PENDING_DECREFS_CAPACITY - 1` references).
+    static TLS_PENDING_DECREFS: RefCell<TlsPendingDecrefs> =
+        const { RefCell::new(TlsPendingDecrefs(Vec::new())) };
+}
+
+#[cfg(not(pyo3_disable_reference_pool))]
+/// Flushes a batch of pending decrefs into the global pool.
+fn flush_pending_decrefs(batch: &mut PyObjVec) {
+    let count = batch.len();
+    if count == 0 {
+        return;
+    }
+    let pool = get_pool();
+    // The count is updated before inserting and only decremented after objects
+    // have been taken out, so `count >= pending_decrefs.len()` holds at all
+    // times. A drain which observes `count == 0` may therefore safely skip the
+    // mutex without missing objects; a stale or in-flight count merely defers
+    // processing of some objects to a later drain (never drops them).
+    pool.pending_count.fetch_add(count, Ordering::Relaxed);
+    pool.pending_decrefs.lock().unwrap().extend(batch.drain(..));
+}
+
+#[cfg(not(pyo3_disable_reference_pool))]
+/// Global storage for objects which were dec_ref while not attached, backing the
+/// thread-local buffers which overflow into it when full.
 struct ReferencePool {
     pending_decrefs: sync::Mutex<PyObjVec>,
+    /// Number of objects currently held in `pending_decrefs`.
+    ///
+    /// This is a best-effort count which allows drains to skip the mutex when the
+    /// pool is empty. Relaxed ordering is sufficient because a stale count merely
+    /// defers processing to the next drain; no decref is ever lost.
+    pending_count: AtomicUsize,
 }
 
 #[cfg(not(pyo3_disable_reference_pool))]
@@ -189,25 +266,30 @@ impl ReferencePool {
     const fn new() -> Self {
         Self {
             pending_decrefs: sync::Mutex::new(Vec::new()),
+            pending_count: AtomicUsize::new(0),
         }
     }
 
+    /// Registers a single object to have its reference count decreased by
+    /// whichever thread next drains the pool.
     fn register_decref(&self, obj: NonNull<ffi::PyObject>) {
+        self.pending_count.fetch_add(1, Ordering::Relaxed);
         self.pending_decrefs.lock().unwrap().push(obj);
     }
 
-    fn drop_deferred_references(&self, _py: Python<'_>) {
+    /// Swaps the pool's pending decrefs with the given batch, returning the
+    /// number of objects which the pool was holding.
+    ///
+    /// The given batch is expected to be empty (while owning spare capacity);
+    /// after the call the pool holds the batch's allocation for reuse, and the
+    /// given batch holds the objects to decref outside of the pool's mutex.
+    fn swap_pending_decrefs(&self, batch: &mut PyObjVec) -> usize {
         let mut pending_decrefs = self.pending_decrefs.lock().unwrap();
-        if pending_decrefs.is_empty() {
-            return;
+        let count = pending_decrefs.len();
+        if count > 0 {
+            mem::swap(&mut *pending_decrefs, batch);
         }
-
-        let decrefs = mem::take(&mut *pending_decrefs);
-        drop(pending_decrefs);
-
-        for ptr in decrefs {
-            unsafe { ffi::Py_DECREF(ptr.as_ptr()) };
-        }
+        count
     }
 }
 
@@ -227,10 +309,47 @@ fn get_pool() -> &'static ReferencePool {
 
 #[cfg_attr(pyo3_disable_reference_pool, inline(always))]
 #[cfg_attr(pyo3_disable_reference_pool, allow(unused_variables))]
-fn drop_deferred_references(py: Python<'_>) {
+fn drop_deferred_references(_py: Python<'_>) {
     #[cfg(not(pyo3_disable_reference_pool))]
-    if let Some(pool) = POOL.get() {
-        pool.drop_deferred_references(py);
+    {
+        // Take the thread-local buffer (including its allocation, to be reused
+        // below) out of thread-local storage, dropping the borrow before any
+        // reference counts are decreased, so that `__del__` handlers which run
+        // during the decrefs cannot observe a mutably-borrowed buffer.
+        let mut batch = TLS_PENDING_DECREFS
+            .try_with(|pending| pending.borrow_mut().take())
+            .unwrap_or_default();
+
+        // SAFETY: all pointers in the batch are owned references which were
+        // handed over to the pool by `register_decref`.
+        for ptr in batch.drain(..) {
+            unsafe { ffi::Py_DECREF(ptr.as_ptr()) };
+        }
+
+        // Drain the global pool, if the count suggests it is non-empty. The swap
+        // leaves the pool holding this thread's spare allocation, so that the
+        // pool does not reallocate on the next flush.
+        if let Some(pool) = POOL.get() {
+            if pool.pending_count.load(Ordering::Relaxed) > 0 {
+                let count = pool.swap_pending_decrefs(&mut batch);
+                pool.pending_count.fetch_sub(count, Ordering::Relaxed);
+                // SAFETY: as above; decref outside of the pool's mutex so that
+                // `__del__` handlers re-entering the drain cannot deadlock.
+                for ptr in batch.drain(..) {
+                    unsafe { ffi::Py_DECREF(ptr.as_ptr()) };
+                }
+            }
+        }
+
+        // Return the batch's allocation to the thread-local buffer to avoid
+        // reallocating on the next drop, unless the buffer was refilled in the
+        // meantime (e.g. by a `__del__` handler which detached).
+        let _ = TLS_PENDING_DECREFS.try_with(|pending| {
+            let mut pending = pending.borrow_mut();
+            if pending.0.is_empty() {
+                pending.0 = batch;
+            }
+        });
     }
 }
 
@@ -257,9 +376,7 @@ impl Drop for SuspendAttach {
 
             // Update counts of `Py<T>` that were dropped while not attached.
             #[cfg(not(pyo3_disable_reference_pool))]
-            if let Some(pool) = POOL.get() {
-                pool.drop_deferred_references(Python::assume_attached());
-            }
+            drop_deferred_references(Python::assume_attached());
         }
     }
 }
@@ -298,8 +415,16 @@ impl Drop for ForbidAttaching {
     }
 }
 
-/// Registers a Python object pointer inside the release pool, to have its reference count decreased
-/// the next time the thread is attached in pyo3.
+/// Registers a Python object pointer to have its reference count decreased
+/// the next time the thread drains pending decrefs in pyo3 (i.e. when it next
+/// attaches, or at the end of a `detach`).
+///
+/// The object is first buffered in thread-local storage; if that buffer fills
+/// up, or the thread exits before draining, it is handed over to the global
+/// pool, from which any thread's next attach will release it. As a
+/// consequence, a handle dropped on a thread which then stays detached is
+/// released by that thread's own next drain (or its exit) rather than by
+/// another thread's attach.
 ///
 /// If the thread is attached, the reference count will be decreased immediately instead of being queued
 /// for later.
@@ -311,7 +436,23 @@ impl Drop for ForbidAttaching {
 pub unsafe fn register_decref(obj: NonNull<ffi::PyObject>) {
     #[cfg(not(pyo3_disable_reference_pool))]
     {
-        get_pool().register_decref(obj);
+        // Fast path: buffer the decref in thread-local storage, taking no lock.
+        // When the buffer fills up, flush it to the global pool (amortizing the
+        // pool's mutex to one lock per `TLS_PENDING_DECREFS_CAPACITY` drops).
+        if TLS_PENDING_DECREFS
+            .try_with(|pending| {
+                let mut pending = pending.borrow_mut();
+                pending.0.push(obj);
+                if pending.0.len() >= TLS_PENDING_DECREFS_CAPACITY {
+                    flush_pending_decrefs(&mut pending.0);
+                }
+            })
+            .is_err()
+        {
+            // Fallback: the thread-local buffer is unavailable (e.g. the thread
+            // is tearing down); queue the decref in the global pool directly.
+            get_pool().register_decref(obj);
+        }
     }
     #[cfg(all(
         pyo3_disable_reference_pool,
@@ -369,23 +510,42 @@ mod tests {
     }
 
     #[cfg(not(pyo3_disable_reference_pool))]
+    fn tls_pending_dec_refs_contain(obj: &Py<PyAny>) -> bool {
+        TLS_PENDING_DECREFS
+            .try_with(|pending| {
+                pending
+                    .borrow()
+                    .0
+                    .contains(&unsafe { NonNull::new_unchecked(obj.as_ptr()) })
+            })
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(pyo3_disable_reference_pool))]
     fn pool_dec_refs_does_not_contain(obj: &Py<PyAny>) -> bool {
-        !get_pool()
-            .pending_decrefs
-            .lock()
-            .unwrap()
-            .contains(&unsafe { NonNull::new_unchecked(obj.as_ptr()) })
+        let obj_ptr = unsafe { NonNull::new_unchecked(obj.as_ptr()) };
+        // Check the thread-local buffer before taking the global pool's mutex,
+        // mirroring the production lock order (TLS borrow never held across the
+        // global lock).
+        !tls_pending_dec_refs_contain(obj)
+            && !get_pool()
+                .pending_decrefs
+                .lock()
+                .unwrap()
+                .contains(&obj_ptr)
     }
 
     // With free-threading, threads can empty the POOL at any time, so this
     // function does not test anything meaningful
     #[cfg(not(any(pyo3_disable_reference_pool, Py_GIL_DISABLED)))]
     fn pool_dec_refs_contains(obj: &Py<PyAny>) -> bool {
-        get_pool()
-            .pending_decrefs
-            .lock()
-            .unwrap()
-            .contains(&unsafe { NonNull::new_unchecked(obj.as_ptr()) })
+        let obj_ptr = unsafe { NonNull::new_unchecked(obj.as_ptr()) };
+        tls_pending_dec_refs_contain(obj)
+            || get_pool()
+                .pending_decrefs
+                .lock()
+                .unwrap()
+                .contains(&obj_ptr)
     }
 
     #[test]
@@ -437,6 +597,122 @@ mod tests {
             // With free-threading, another thread could still be processing
             // DECREFs after releasing the lock on the POOL, so the
             // refcnt could still be 2 when this assert happens
+            #[cfg(not(Py_GIL_DISABLED))]
+            assert_eq!(obj.get_refcnt(py), 1);
+            assert!(pool_dec_refs_does_not_contain(&obj));
+        });
+    }
+
+    #[test]
+    #[cfg(not(pyo3_disable_reference_pool))]
+    fn test_register_decref_buffers_small_batches_out_of_global_pool() {
+        Python::attach(|py| {
+            let obj = get_object(py);
+
+            // One fewer than the thread-local batch threshold: pending decrefs below
+            // the threshold must be buffered in the dropping thread's thread-local
+            // buffer and not contend the global pool.
+            let refs: Vec<Py<PyAny>> = (0..TLS_PENDING_DECREFS_CAPACITY - 1)
+                .map(|_| obj.clone_ref(py))
+                .collect();
+            // Capture the address as `usize` (not `NonNull`) so that the closure
+            // below can be `Ungil` while detached.
+            let obj_addr = obj.as_ptr() as usize;
+
+            py.detach(move || {
+                drop(refs);
+
+                // The dropped handles are buffered in this thread's TLS and must
+                // not reach the global pool. (Tests run in parallel may push their
+                // own objects into the global pool, so only assert that these
+                // handles are absent from it.)
+                assert!(!get_pool()
+                    .pending_decrefs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|ptr| ptr.as_ptr() as usize == obj_addr));
+            });
+
+            // The end of `detach` drains this thread's pending decrefs.
+            assert_eq!(obj.get_refcnt(py), 1);
+            assert!(pool_dec_refs_does_not_contain(&obj));
+        });
+    }
+
+    #[test]
+    #[cfg(not(pyo3_disable_reference_pool))]
+    fn test_register_decref_flushes_full_tls_batch_to_global_pool() {
+        Python::attach(|py| {
+            let obj = get_object(py);
+
+            // Exactly `TLS_PENDING_DECREFS_CAPACITY` handles dropped in one
+            // detached region fill the buffer and flush it to the global pool.
+            let refs: Vec<Py<PyAny>> = (0..TLS_PENDING_DECREFS_CAPACITY)
+                .map(|_| obj.clone_ref(py))
+                .collect();
+            // The next handle, below the threshold, is buffered again.
+            let extra = obj.clone_ref(py);
+
+            py.detach(move || {
+                drop(refs);
+
+                // The buffer was flushed when it filled up, so this thread's
+                // buffer is empty again. (This thread's own TLS is not touched
+                // by the tests running in parallel, so this is race-free.)
+                assert!(TLS_PENDING_DECREFS
+                    .try_with(|pending| pending.borrow().0.is_empty())
+                    .unwrap_or(false));
+
+                drop(extra);
+
+                // The handle dropped after the flush is buffered in TLS again.
+                assert!(TLS_PENDING_DECREFS
+                    .try_with(|pending| pending.borrow().0.len() == 1)
+                    .unwrap_or(false));
+            });
+
+            // The end of `detach` drains both the flushed batch and the handle
+            // buffered after it: all references are released exactly once.
+            assert_eq!(obj.get_refcnt(py), 1);
+            assert!(pool_dec_refs_does_not_contain(&obj));
+        });
+    }
+
+    #[test]
+    #[cfg(all(not(pyo3_disable_reference_pool), not(target_arch = "wasm32")))]
+    fn test_detached_thread_flushes_tls_buffer_to_global_pool_at_exit() {
+        let obj = Python::attach(|py| {
+            let obj = get_object(py);
+            let reference = obj.clone_ref(py);
+
+            // Dropping below the batch threshold while detached buffers the
+            // handle in the spawned thread's TLS; the buffer must be flushed to
+            // the global pool when that thread exits.
+            std::thread::spawn(move || drop(reference)).join().unwrap();
+
+            // The handle must have been flushed to the global pool at thread exit.
+            // A test running in parallel may have drained the pool in the meantime,
+            // in which case the reference was already released — either way it was
+            // not lost.
+            let obj_ptr = unsafe { NonNull::new_unchecked(obj.as_ptr()) };
+            let pending_in_pool = get_pool()
+                .pending_decrefs
+                .lock()
+                .unwrap()
+                .contains(&obj_ptr);
+            assert!(
+                pending_in_pool || obj.get_refcnt(py) == 1,
+                "reference dropped on an exited thread was lost"
+            );
+            obj
+        });
+
+        // On next attach, the reference is released.
+        Python::attach(|py| {
+            // With free-threading, another thread could still be processing the
+            // DECREFs for a batch it took from the pool, so the refcount is only
+            // deterministic on builds with the GIL.
             #[cfg(not(Py_GIL_DISABLED))]
             assert_eq!(obj.get_refcnt(py), 1);
             assert!(pool_dec_refs_does_not_contain(&obj));
@@ -561,10 +837,61 @@ mod tests {
             let capsule =
                 unsafe { ffi::PyCapsule_New(ptr as _, std::ptr::null(), Some(capsule_drop)) };
 
-            get_pool().register_decref(NonNull::new(capsule).unwrap());
+            // Queue the capsule through the production entry point, so that the
+            // capsule is drained from the thread-local buffer and the recursive
+            // drain in `capsule_drop` re-enters `drop_deferred_references` while
+            // the outer drain is in progress.
+            unsafe { register_decref(NonNull::new(capsule).unwrap()) };
 
             // Updating the counts will call decref on the capsule, which calls capsule_drop
-            get_pool().drop_deferred_references(py);
+            drop_deferred_references(py);
+        })
+    }
+
+    #[test]
+    #[cfg(not(pyo3_disable_reference_pool))]
+    fn test_reentrant_drain_tls_refill_is_not_clobbered() {
+        Python::attach(|py| {
+            let obj = get_object(py);
+            // The capsule stores a second reference to `obj`, which its
+            // destructor adopts and drops while detached.
+            let ptr = obj.clone_ref(py).into_ptr();
+
+            unsafe extern "C" fn capsule_drop(capsule: *mut ffi::PyObject) {
+                // This callback runs from the drain's decref loop, while the
+                // thread is attached.
+                let pool = unsafe { AttachGuard::assume() };
+
+                // Rebuild the handle (as a detach-safe `Py`, so that it may be
+                // dropped while detached) so that it can be released.
+                let handle = unsafe {
+                    use crate::Bound;
+
+                    Bound::from_owned_ptr(
+                        pool.python(),
+                        ffi::PyCapsule_GetPointer(capsule, std::ptr::null()) as _,
+                    )
+                    .unbind()
+                };
+
+                // Detach and drop the handle: while the outer drain is still in
+                // progress, the handle is buffered in the thread-local storage,
+                // and the end of this detach runs a nested drain which must
+                // release it without the outer drain clobbering the buffer.
+                pool.python().detach(move || drop(handle));
+            }
+
+            let capsule =
+                unsafe { ffi::PyCapsule_New(ptr as _, std::ptr::null(), Some(capsule_drop)) };
+
+            unsafe { register_decref(NonNull::new(capsule).unwrap()) };
+
+            drop_deferred_references(py);
+
+            // The capsule and the handle dropped by its destructor have both
+            // been released exactly once.
+            assert_eq!(obj.get_refcnt(py), 1);
+            assert!(pool_dec_refs_does_not_contain(&obj));
         })
     }
 
