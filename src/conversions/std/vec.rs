@@ -12,6 +12,13 @@ use crate::{
     Borrowed, CastError, PyResult, PyTypeInfo,
 };
 use crate::{Bound, PyAny, PyErr, Python};
+#[cfg(all(
+    not(Py_LIMITED_API),
+    not(PyPy),
+    not(GraalPy),
+    not(Py_GIL_DISABLED)
+))]
+use crate::ffi_ptr_ext::FfiPtrExt;
 
 impl<'py, T> IntoPyObject<'py> for Vec<T>
 where
@@ -82,6 +89,22 @@ where
             return Err(PyTypeError::new_err("Can't extract `str` to `Vec`"));
         }
 
+        // Borrowed fast path for exact `list` inputs of element types whose
+        // extraction is known not to execute arbitrary Python code for the
+        // shape of the actual elements. Kept in a separate (outlined) function
+        // so that the code layout of the common paths below is unaffected.
+        #[cfg(all(
+            not(Py_LIMITED_API),
+            not(PyPy),
+            not(GraalPy),
+            not(Py_GIL_DISABLED)
+        ))]
+        if PyList::is_exact_type_of(&obj) {
+            if let Some(pure) = T::borrowed_item_extractor(crate::conversion::private::Token) {
+                return extract_borrowed_list(obj, pure);
+            }
+        }
+
         extract_sequence(obj)
     }
 
@@ -140,6 +163,72 @@ where
     let mut v = Vec::with_capacity(seq.len().unwrap_or(0));
     for item in seq.try_iter()? {
         v.push(item?.extract::<T>().map_err(Into::into)?);
+    }
+    Ok(v)
+}
+
+/// Extracts a `Vec<T>` from an exact `list` by borrowed (reference-free)
+/// per-index access, eliding the per-element reference-count traffic of the
+/// owned path.
+///
+/// `pure` returns `Ok(None)` for element shapes which are not eligible (e.g.
+/// subclasses, or objects defining `__index__` / `__float__`); those elements
+/// fall back to the owned path individually.
+///
+/// Soundness: the per-item gate guarantees that the interpreter is not re
+/// entered while a borrowed item pointer is live, so the list cannot be
+/// mutated and the borrowed item stays valid.
+///
+/// `#[inline(never)]` keeps this monomorphization out of the shared
+/// `extract_sequence` body, so that its code layout (and thus performance) is
+/// unchanged for all other paths.
+#[cfg(all(
+    not(Py_LIMITED_API),
+    not(PyPy),
+    not(GraalPy),
+    not(Py_GIL_DISABLED)
+))]
+#[inline(never)]
+fn extract_borrowed_list<'py, T, E>(
+    obj: Borrowed<'_, 'py, PyAny>,
+    _pure: E,
+) -> PyResult<Vec<T>>
+where
+    T: FromPyObjectOwned<'py>,
+    E: crate::conversion::PureItemExtract<Target = T>,
+{
+    debug_assert!(PyList::is_exact_type_of(&obj));
+    let list = unsafe { obj.cast_unchecked::<PyList>() };
+    let py = list.py();
+    let mut v = Vec::with_capacity(list.len());
+    let mut length = list.len();
+    let mut index = 0usize;
+    loop {
+        // `T::extract` can run arbitrary Python code on the fallback path
+        // (elements which failed the pure gate), which can mutate the list.
+        // Re-clamp the length every step so that we never read out of
+        // bounds, and bound iteration by the initial length so elements
+        // appended during extraction are not extracted - matching
+        // `list.iter()` semantics.
+        length = length.min(list.len());
+        if index >= length {
+            break;
+        }
+        // Safety: `index < length <= list.len()` was just checked, so the
+        // item slot is in bounds and the list holds a reference keeping it
+        // alive.
+        let item = unsafe { ffi::PyList_GET_ITEM(list.as_ptr(), index as ffi::Py_ssize_t) };
+        match E::extract_pure(unsafe { item.assume_borrowed_unchecked(py) }) {
+            Ok(Some(value)) => v.push(value),
+            Ok(None) => {
+                // Not eligible for pure extraction: take an owned reference
+                // (incref) and run the ordinary extraction path.
+                let item = unsafe { item.assume_borrowed_unchecked(py) }.to_owned();
+                v.push(item.extract::<T>().map_err(Into::into)?);
+            }
+            Err(err) => return Err(err),
+        }
+        index += 1;
     }
     Ok(v)
 }
@@ -274,6 +363,110 @@ lst = [Evil(), Evil(), Evil()]",
             .unwrap();
             let obj = py.eval(c"lst", Some(&globals), Some(&globals)).unwrap();
             assert_eq!(obj.extract::<Vec<i64>>().unwrap(), [0, 0, 0]);
+        });
+    }
+
+    #[test]
+    fn test_extract_vec_mixed_shapes_falls_back_per_item() {
+        Python::attach(|py| {
+            // exact `int`s alongside an object with `__index__`: the borrowed
+            // fast path must fall back to the owned path for the non-exact
+            // element while keeping exact results.
+            let globals = PyDict::new(py);
+            py.run(
+                c"class IntLike:
+    def __index__(self):
+        return 42
+lst = [1, IntLike(), 3]",
+                Some(&globals),
+                Some(&globals),
+            )
+            .unwrap();
+            let obj = py.eval(c"lst", Some(&globals), Some(&globals)).unwrap();
+            assert_eq!(obj.extract::<Vec<i64>>().unwrap(), [1, 42, 3]);
+        });
+    }
+
+    #[test]
+    fn test_extract_vec_from_int_subclass_list() {
+        Python::attach(|py| {
+            // `int` subclasses are not eligible for the borrowed fast path,
+            // so they take the owned fallback per item.
+            let globals = PyDict::new(py);
+            py.run(
+                c"class MyInt(int):
+    pass
+lst = [MyInt(1), MyInt(2)]",
+                Some(&globals),
+                Some(&globals),
+            )
+            .unwrap();
+            let obj = py.eval(c"lst", Some(&globals), Some(&globals)).unwrap();
+            assert_eq!(obj.extract::<Vec<i64>>().unwrap(), [1, 2]);
+        });
+    }
+
+    #[test]
+    fn test_extract_vec_of_string_from_list() {
+        Python::attach(|py| {
+            let obj = py.eval(c"['a', 'b']", None, None).unwrap();
+            assert_eq!(obj.extract::<Vec<String>>().unwrap(), ["a", "b"]);
+        });
+    }
+
+    #[test]
+    fn test_extract_vec_mixed_str_shapes() {
+        Python::attach(|py| {
+            // exact `str`s alongside a `str` subclass: the subclass falls
+            // back to the owned path per item.
+            let globals = PyDict::new(py);
+            py.run(
+                c"class MyStr(str):
+    pass
+lst = ['a', MyStr('b'), 'c']",
+                Some(&globals),
+                Some(&globals),
+            )
+            .unwrap();
+            let obj = py.eval(c"lst", Some(&globals), Some(&globals)).unwrap();
+            assert_eq!(obj.extract::<Vec<String>>().unwrap(), ["a", "b", "c"]);
+        });
+    }
+
+    #[test]
+    fn test_extract_vec_of_float_from_list() {
+        Python::attach(|py| {
+            // exact floats and exact ints are both eligible for the
+            // borrowed fast path of `f64` extraction.
+            let obj = py.eval(c"[1.0, 2, 3.5]", None, None).unwrap();
+            assert_eq!(obj.extract::<Vec<f64>>().unwrap(), [1.0, 2.0, 3.5]);
+        });
+    }
+
+    #[test]
+    fn test_extract_vec_float_mixed_shapes() {
+        Python::attach(|py| {
+            // a `__float__` object is not eligible; it falls back per item.
+            let globals = PyDict::new(py);
+            py.run(
+                c"class FloatLike:
+    def __float__(self):
+        return 7.0
+lst = [1.0, FloatLike(), 2.5]",
+                Some(&globals),
+                Some(&globals),
+            )
+            .unwrap();
+            let obj = py.eval(c"lst", Some(&globals), Some(&globals)).unwrap();
+            assert_eq!(obj.extract::<Vec<f64>>().unwrap(), [1.0, 7.0, 2.5]);
+        });
+    }
+
+    #[test]
+    fn test_extract_vec_failure_mid_loop() {
+        Python::attach(|py| {
+            let obj = py.eval(c"[1, 'x']", None, None).unwrap();
+            assert!(obj.extract::<Vec<i64>>().is_err());
         });
     }
 

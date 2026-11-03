@@ -8,6 +8,7 @@ use crate::type_object::PyTypeInfo;
 #[cfg(not(any(Py_LIMITED_API, PyPy)))]
 use crate::exceptions;
 use crate::{ffi, ffi_ptr_ext::FfiPtrExt, instance::Bound, Borrowed, FromPyObject, PyAny, PyErr, Python};
+use std::marker::PhantomData;
 use std::convert::Infallible;
 use std::ffi::c_double;
 
@@ -154,6 +155,20 @@ impl<'py> FromPyObject<'_, 'py> for f64 {
         Ok(v)
     }
 
+    #[cfg(all(
+        not(Py_LIMITED_API),
+        not(PyPy),
+        not(GraalPy),
+        not(Py_GIL_DISABLED)
+    ))]
+    #[doc(hidden)]
+    #[inline(always)]
+    fn borrowed_item_extractor(
+        _: crate::conversion::private::Token,
+    ) -> Option<impl crate::conversion::PureItemExtract<Target = f64>> {
+        Some(ExactFloatExtractor(PhantomData))
+    }
+
     #[cfg(feature = "experimental-inspect")]
     fn type_input() -> TypeInfo {
         Self::type_output()
@@ -187,6 +202,62 @@ fn extract_float_type_error(obj: Borrowed<'_, '_, PyAny>) -> PyErr {
     message.push_str(PREFIX);
     message.push_str(&type_name);
     exceptions::PyTypeError::new_err(message)
+}
+
+/// Whether `obj` is exactly a Python `float` (not a subclass).
+///
+/// Used by the borrowed sequence-extraction fast path: extracting a float
+/// from an *exact* `float` (or an exact `int`) reads the value directly and
+/// cannot execute arbitrary Python code, so the borrowed item pointer cannot
+/// be invalidated mid-extraction.
+#[cfg(all(
+    not(Py_LIMITED_API),
+    not(PyPy),
+    not(GraalPy),
+    not(Py_GIL_DISABLED)
+))]
+#[inline(always)]
+unsafe fn is_exact_float(obj: *mut ffi::PyObject) -> bool {
+    unsafe { (*obj).ob_type == std::ptr::addr_of_mut!(ffi::PyFloat_Type) }
+}
+
+/// Borrowed-item extractor for the float family (see
+/// `FromPyObject::borrowed_item_extractor`). Returns `Ok(None)` for anything
+/// which is neither an exact `float` nor an exact `int`, so that the caller
+/// falls back to the owned (reference-counting) path for that element.
+#[cfg(all(
+    not(Py_LIMITED_API),
+    not(PyPy),
+    not(GraalPy),
+    not(Py_GIL_DISABLED)
+))]
+pub(crate) struct ExactFloatExtractor<T>(PhantomData<T>);
+
+#[cfg(all(
+    not(Py_LIMITED_API),
+    not(PyPy),
+    not(GraalPy),
+    not(Py_GIL_DISABLED)
+))]
+impl<T> crate::conversion::PureItemExtract for ExactFloatExtractor<T>
+where
+    T: for<'a, 'py> FromPyObject<'a, 'py>,
+{
+    type Target = T;
+
+    #[inline(always)]
+    fn extract_pure(item: Borrowed<'_, '_, PyAny>) -> Result<Option<T>, PyErr> {
+        use crate::conversions::std::num::is_exact_int;
+
+        // SAFETY (per the `PureItemExtract` contract): for exact `float` /
+        // `int` inputs the extraction below cannot run arbitrary Python
+        // code.
+        if unsafe { is_exact_float(item.as_ptr()) || is_exact_int(item.as_ptr()) } {
+            T::extract(item).map(Some).map_err(Into::into)
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 impl<'py> IntoPyObject<'py> for f32 {
@@ -235,6 +306,20 @@ impl<'a, 'py> FromPyObject<'a, 'py> for f32 {
 
     fn extract(obj: Borrowed<'_, 'py, PyAny>) -> Result<Self, Self::Error> {
         Ok(obj.extract::<f64>()? as f32)
+    }
+
+    #[cfg(all(
+        not(Py_LIMITED_API),
+        not(PyPy),
+        not(GraalPy),
+        not(Py_GIL_DISABLED)
+    ))]
+    #[doc(hidden)]
+    #[inline(always)]
+    fn borrowed_item_extractor(
+        _: crate::conversion::private::Token,
+    ) -> Option<impl crate::conversion::PureItemExtract<Target = f32>> {
+        Some(ExactFloatExtractor(PhantomData))
     }
 
     #[cfg(feature = "experimental-inspect")]

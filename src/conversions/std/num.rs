@@ -13,6 +13,7 @@ use crate::{exceptions, ffi, Borrowed, Bound, FromPyObject, PyAny, PyErr, PyResu
 use std::convert::Infallible;
 use std::ffi::c_long;
 use std::mem::MaybeUninit;
+use std::marker::PhantomData;
 use std::num::{
     NonZeroI128, NonZeroI16, NonZeroI32, NonZeroI64, NonZeroI8, NonZeroIsize, NonZeroU128,
     NonZeroU16, NonZeroU32, NonZeroU64, NonZeroU8, NonZeroUsize,
@@ -68,6 +69,20 @@ macro_rules! int_fits_larger_int {
                 let val: $larger_type = obj.extract()?;
                 <$rust_type>::try_from(val)
                     .map_err(|e| exceptions::PyOverflowError::new_err(e.to_string()))
+            }
+
+            #[cfg(all(
+                not(Py_LIMITED_API),
+                not(PyPy),
+                not(GraalPy),
+                not(Py_GIL_DISABLED)
+            ))]
+            #[doc(hidden)]
+            #[inline(always)]
+            fn borrowed_item_extractor(
+                _: crate::conversion::private::Token,
+            ) -> Option<impl crate::conversion::PureItemExtract<Target = Self>> {
+                Some(ExactIntExtractor(PhantomData))
             }
 
             #[cfg(feature = "experimental-inspect")]
@@ -163,6 +178,20 @@ macro_rules! int_convert_u64_or_i64 {
                 extract_int!(obj, !0, $pylong_as_ll_or_ull, $force_index_call)
             }
 
+            #[cfg(all(
+                not(Py_LIMITED_API),
+                not(PyPy),
+                not(GraalPy),
+                not(Py_GIL_DISABLED)
+            ))]
+            #[doc(hidden)]
+            #[inline(always)]
+            fn borrowed_item_extractor(
+                _: crate::conversion::private::Token,
+            ) -> Option<impl crate::conversion::PureItemExtract<Target = Self>> {
+                Some(ExactIntExtractor(PhantomData))
+            }
+
             #[cfg(feature = "experimental-inspect")]
             fn type_input() -> TypeInfo {
                 Self::type_output()
@@ -224,6 +253,20 @@ macro_rules! int_fits_c_long {
                 let val: c_long = extract_int!(obj, -1, ffi::PyLong_AsLong)?;
                 <$rust_type>::try_from(val)
                     .map_err(|e| exceptions::PyOverflowError::new_err(e.to_string()))
+            }
+
+            #[cfg(all(
+                not(Py_LIMITED_API),
+                not(PyPy),
+                not(GraalPy),
+                not(Py_GIL_DISABLED)
+            ))]
+            #[doc(hidden)]
+            #[inline(always)]
+            fn borrowed_item_extractor(
+                _: crate::conversion::private::Token,
+            ) -> Option<impl crate::conversion::PureItemExtract<Target = Self>> {
+                Some(ExactIntExtractor(PhantomData))
             }
 
             #[cfg(feature = "experimental-inspect")]
@@ -333,6 +376,20 @@ impl<'py> FromPyObject<'_, 'py> for u8 {
         } else {
             None
         }
+    }
+
+    #[cfg(all(
+        not(Py_LIMITED_API),
+        not(PyPy),
+        not(GraalPy),
+        not(Py_GIL_DISABLED)
+    ))]
+    #[doc(hidden)]
+    #[inline(always)]
+    fn borrowed_item_extractor(
+        _: crate::conversion::private::Token,
+    ) -> Option<impl crate::conversion::PureItemExtract<Target = u8>> {
+        Some(ExactIntExtractor(PhantomData))
     }
 }
 
@@ -718,6 +775,59 @@ unsafe fn is_not_indexable(obj: *mut ffi::PyObject) -> bool {
     }
 }
 
+/// Whether `obj` is exactly a Python `int` (not a subclass).
+///
+/// Used by the borrowed sequence-extraction fast path: extracting an integer
+/// from an *exact* `int` reads the digit representation directly and cannot
+/// execute arbitrary Python code, so the borrowed item pointer cannot be
+/// invalidated mid-extraction.
+#[cfg(all(
+    not(Py_LIMITED_API),
+    not(PyPy),
+    not(GraalPy),
+    not(Py_GIL_DISABLED)
+))]
+#[inline(always)]
+pub(crate) unsafe fn is_exact_int(obj: *mut ffi::PyObject) -> bool {
+    unsafe { (*obj).ob_type == std::ptr::addr_of_mut!(ffi::PyLong_Type) }
+}
+
+/// Borrowed-item extractor for the integer family (see
+/// `FromPyObject::borrowed_item_extractor`). Returns `Ok(None)` for anything
+/// which is not an exact `int`, so that the caller falls back to the owned
+/// (reference-counting) path for that element.
+#[cfg(all(
+    not(Py_LIMITED_API),
+    not(PyPy),
+    not(GraalPy),
+    not(Py_GIL_DISABLED)
+))]
+pub(crate) struct ExactIntExtractor<T>(PhantomData<T>);
+
+#[cfg(all(
+    not(Py_LIMITED_API),
+    not(PyPy),
+    not(GraalPy),
+    not(Py_GIL_DISABLED)
+))]
+impl<T> crate::conversion::PureItemExtract for ExactIntExtractor<T>
+where
+    T: for<'a, 'py> FromPyObject<'a, 'py>,
+{
+    type Target = T;
+
+    #[inline(always)]
+    fn extract_pure(item: Borrowed<'_, '_, PyAny>) -> Result<Option<T>, PyErr> {
+        // SAFETY (per the `PureItemExtract` contract): for exact `int`
+        // inputs the extraction below cannot run arbitrary Python code.
+        if unsafe { is_exact_int(item.as_ptr()) } {
+            T::extract(item).map(Some).map_err(Into::into)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 /// Constructs the `TypeError` returned when integer extraction is attempted
 /// on a type which can never be an integer. The message mirrors CPython's own
 /// message from `PyNumber_Index` failures (built from `tp_name`), and is
@@ -800,6 +910,20 @@ macro_rules! nonzero_int_impl {
                 let val: $primitive_type = obj.extract()?;
                 <$nonzero_type>::try_from(val)
                     .map_err(|_| exceptions::PyValueError::new_err("invalid zero value"))
+            }
+
+            #[cfg(all(
+                not(Py_LIMITED_API),
+                not(PyPy),
+                not(GraalPy),
+                not(Py_GIL_DISABLED)
+            ))]
+            #[doc(hidden)]
+            #[inline(always)]
+            fn borrowed_item_extractor(
+                _: crate::conversion::private::Token,
+            ) -> Option<impl crate::conversion::PureItemExtract<Target = Self>> {
+                Some(ExactIntExtractor(PhantomData))
             }
 
             #[cfg(feature = "experimental-inspect")]

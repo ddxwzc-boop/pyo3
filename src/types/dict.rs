@@ -427,6 +427,34 @@ impl<'a, 'py> Borrowed<'a, 'py, PyDict> {
     pub(crate) unsafe fn iter_borrowed(self) -> BorrowedDictIter<'a, 'py> {
         BorrowedDictIter::new(self)
     }
+
+    /// Variant of the owned [`BoundDictIterator`] which hands out borrowed
+    /// `(key, value)` pairs (no reference counting per entry), while keeping
+    /// the exact same mutation guards (and panics) as the owned iterator.
+    ///
+    /// This backs the borrowed dict-extraction fast path for element types
+    /// whose extraction is known not to execute arbitrary Python code.
+    ///
+    /// # Safety
+    /// The caller must guarantee that no arbitrary Python code runs while a
+    /// borrowed item from this iterator is live (e.g. because extraction of
+    /// the items is known to be pure), because mutating the dictionary would
+    /// invalidate the borrowed pointers.
+    #[cfg(all(
+        not(Py_LIMITED_API),
+        not(PyPy),
+        not(GraalPy),
+        not(Py_GIL_DISABLED)
+    ))]
+    pub(crate) unsafe fn iter_borrowed_guarded(self) -> GuardedBorrowedDictIter<'a, 'py> {
+        let len = dict_len(&self);
+        GuardedBorrowedDictIter {
+            dict: self,
+            ppos: 0,
+            di_used: len,
+            remaining: len,
+        }
+    }
 }
 
 fn dict_len(dict: &Bound<'_, PyDict>) -> Py_ssize_t {
@@ -710,6 +738,94 @@ impl<'py> BoundDictIterator<'py> {
                 remaining,
             },
         }
+    }
+}
+
+/// Variant of [`BoundDictIterator`] which yields borrowed `(key, value)`
+/// pairs without reference counting, with the same mutation guards (and
+/// panics) as the owned iterator.
+///
+/// Only used by the borrowed dict-extraction fast path (see
+/// [`Borrowed::iter_borrowed_guarded`]).
+#[cfg(all(
+    not(Py_LIMITED_API),
+    not(PyPy),
+    not(GraalPy),
+    not(Py_GIL_DISABLED)
+))]
+pub(crate) struct GuardedBorrowedDictIter<'a, 'py> {
+    dict: Borrowed<'a, 'py, PyDict>,
+    ppos: ffi::Py_ssize_t,
+    di_used: ffi::Py_ssize_t,
+    remaining: ffi::Py_ssize_t,
+}
+
+#[cfg(all(
+    not(Py_LIMITED_API),
+    not(PyPy),
+    not(GraalPy),
+    not(Py_GIL_DISABLED)
+))]
+impl<'a, 'py> Iterator for GuardedBorrowedDictIter<'a, 'py> {
+    type Item = (Borrowed<'a, 'py, PyAny>, Borrowed<'a, 'py, PyAny>);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let ma_used = dict_len(&self.dict);
+
+        // These checks (and their panics) mirror the owned
+        // `BoundDictIterator` / CPython's dict iterator: if the dict is
+        // mutated during iteration, this is detected between iterations.
+        if self.di_used != ma_used {
+            self.di_used = -1;
+            panic!("dictionary changed size during iteration");
+        };
+
+        if self.remaining == -1 {
+            self.di_used = -1;
+            panic!("dictionary keys changed during iteration");
+        };
+
+        let mut key: *mut ffi::PyObject = std::ptr::null_mut();
+        let mut value: *mut ffi::PyObject = std::ptr::null_mut();
+
+        if unsafe { ffi::PyDict_Next(self.dict.as_ptr(), &mut self.ppos, &mut key, &mut value) }
+            != 0
+        {
+            self.remaining -= 1;
+            let py = self.dict.py();
+            // Safety:
+            // - PyDict_Next returns borrowed values
+            // - we have already checked that `PyDict_Next` succeeded, so we can assume these to be non-null
+            // - the caller of `iter_borrowed_guarded` guarantees that no
+            //   arbitrary Python code runs while these borrows are live
+            Some(unsafe {
+                (
+                    key.assume_borrowed_unchecked(py),
+                    value.assume_borrowed_unchecked(py),
+                )
+            })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+#[cfg(all(
+    not(Py_LIMITED_API),
+    not(PyPy),
+    not(GraalPy),
+    not(Py_GIL_DISABLED)
+))]
+impl ExactSizeIterator for GuardedBorrowedDictIter<'_, '_> {
+    fn len(&self) -> usize {
+        self.remaining as usize
     }
 }
 
