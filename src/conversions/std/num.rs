@@ -817,14 +817,10 @@ where
     type Target = T;
 
     #[inline(always)]
-    fn extract_pure(item: Borrowed<'_, '_, PyAny>) -> Result<Option<T>, PyErr> {
+    fn is_pure_shape(item: Borrowed<'_, '_, PyAny>) -> bool {
         // SAFETY (per the `PureItemExtract` contract): for exact `int`
-        // inputs the extraction below cannot run arbitrary Python code.
-        if unsafe { is_exact_int(item.as_ptr()) } {
-            T::extract(item).map(Some).map_err(Into::into)
-        } else {
-            Ok(None)
-        }
+        // inputs extraction cannot run arbitrary Python code.
+        unsafe { is_exact_int(item.as_ptr()) }
     }
 }
 

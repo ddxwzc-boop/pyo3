@@ -218,15 +218,17 @@ where
         // item slot is in bounds and the list holds a reference keeping it
         // alive.
         let item = unsafe { ffi::PyList_GET_ITEM(list.as_ptr(), index as ffi::Py_ssize_t) };
-        match E::extract_pure(unsafe { item.assume_borrowed_unchecked(py) }) {
-            Ok(Some(value)) => v.push(value),
-            Ok(None) => {
-                // Not eligible for pure extraction: take an owned reference
-                // (incref) and run the ordinary extraction path.
-                let item = unsafe { item.assume_borrowed_unchecked(py) }.to_owned();
-                v.push(item.extract::<T>().map_err(Into::into)?);
-            }
-            Err(err) => return Err(err),
+        let item = unsafe { item.assume_borrowed_unchecked(py) };
+        if E::is_pure_shape(item) {
+            // SAFETY (per the `PureItemExtract` contract): extraction for
+            // this shape cannot run arbitrary Python code, so the borrowed
+            // pointer stays valid.
+            v.push(T::extract(item).map_err(Into::into)?);
+        } else {
+            // Not eligible for pure extraction: take an owned reference
+            // (incref) and run the ordinary extraction path.
+            let item = item.to_owned();
+            v.push(item.extract::<T>().map_err(Into::into)?);
         }
         index += 1;
     }

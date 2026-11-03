@@ -161,38 +161,53 @@ where
     // fallback entries take owned references before running any re-entrant
     // code.
     for (key, value) in unsafe { dict.as_borrowed().iter_borrowed_guarded() } {
-        let k_res = KE::extract_pure(key);
-        let v_res = VE::extract_pure(value);
-        match (k_res, v_res) {
-            (Err(err), _) => return Err(err),
-            (_, Err(err)) => return Err(err),
-            (Ok(Some(k)), Ok(Some(v))) => insert(k, v),
-            (Ok(k_opt), Ok(v_opt)) => {
-                // At least one side is not pure-eligible for this entry:
-                // take owned references first (so that re-entrant extraction
-                // cannot invalidate them), then extract the missing side(s)
-                // via the ordinary owned path.
-                let key_owned = key.to_owned();
-                let value_owned = value.to_owned();
-                let k = match k_opt {
-                    Some(k) => k,
-                    None => match key_owned.extract::<K>() {
-                        Ok(k) => k,
-                        Err(err) => return Err(err.into()),
-                    },
-                };
-                let v = match v_opt {
-                    Some(v) => v,
-                    None => match value_owned.extract::<V>() {
-                        Ok(v) => v,
-                        Err(err) => return Err(err.into()),
-                    },
-                };
-                insert(k, v);
-            }
+        // The gates are plain (register-sized) booleans so that the hot loop
+        // stays codegen-equivalent to the owned path plus two checks, and
+        // never materializes `Result<Option<T>, PyErr>`-sized values; the
+        // fallback is outlined (and marked cold) below.
+        if KE::is_pure_shape(key) && VE::is_pure_shape(value) {
+            // SAFETY (per the `PureItemExtract` contract): extraction for
+            // these shapes cannot run arbitrary Python code, so the borrowed
+            // pointers stay valid.
+            let k = K::extract(key).map_err(Into::into)?;
+            let v = V::extract(value).map_err(Into::into)?;
+            insert(k, v);
+        } else {
+            let (k, v) = dict_owned_fallback::<K, V>(key, value)?;
+            insert(k, v);
         }
     }
     Ok(())
+}
+
+/// Owned (reference-counting) fallback for dict entries whose extraction is
+/// not pure-eligible: takes owned references *before* running the
+/// (potentially re-entrant) extraction, so that re-entrant code cannot
+/// invalidate them.
+///
+/// Outlined and marked cold so that the hot borrowed loop above does not
+/// carry this code inline (which measurably hurts its codegen).
+#[cfg(all(
+    not(Py_LIMITED_API),
+    not(PyPy),
+    not(GraalPy),
+    not(Py_GIL_DISABLED)
+))]
+#[cold]
+#[inline(never)]
+fn dict_owned_fallback<'py, K, V>(
+    key: Borrowed<'_, 'py, PyAny>,
+    value: Borrowed<'_, 'py, PyAny>,
+) -> Result<(K, V), PyErr>
+where
+    K: FromPyObjectOwned<'py>,
+    V: FromPyObjectOwned<'py>,
+{
+    let key_owned = key.to_owned();
+    let value_owned = value.to_owned();
+    let k = key_owned.extract::<K>().map_err(Into::into)?;
+    let v = value_owned.extract::<V>().map_err(Into::into)?;
+    Ok((k, v))
 }
 
 impl<'py, K, V, S> FromPyObject<'_, 'py> for collections::HashMap<K, V, S>

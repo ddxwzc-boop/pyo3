@@ -265,16 +265,11 @@ impl crate::conversion::PureItemExtract for ExactStrExtractor {
     type Target = String;
 
     #[inline(always)]
-    fn extract_pure(item: Borrowed<'_, '_, PyAny>) -> Result<Option<String>, PyErr> {
+    fn is_pure_shape(item: Borrowed<'_, '_, PyAny>) -> bool {
         // SAFETY (per the `PureItemExtract` contract): for exact `str`
-        // inputs the extraction below cannot run arbitrary Python code (the
-        // `cast` is a plain type check, and `to_cow` reads the character
-        // data).
-        if unsafe { is_exact_str(item.as_ptr()) } {
-            String::extract(item).map(Some)
-        } else {
-            Ok(None)
-        }
+        // inputs extraction cannot run arbitrary Python code (the `cast` is
+        // a plain type check, and `to_cow` reads the character data).
+        unsafe { is_exact_str(item.as_ptr()) }
     }
 }
 

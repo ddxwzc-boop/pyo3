@@ -497,9 +497,7 @@ pub trait FromPyObject<'a, 'py>: Sized {
             type Target = T;
 
             #[inline(always)]
-            fn extract_pure(
-                item: Borrowed<'_, '_, PyAny>,
-            ) -> Result<Option<Self::Target>, PyErr> {
+            fn is_pure_shape(item: Borrowed<'_, '_, PyAny>) -> bool {
                 // never constructed: the default hook returns `None`
                 unreachable!("{item:?}")
             }
@@ -537,24 +535,23 @@ pub(crate) use from_py_object_sequence::FromPyObjectSequence;
 mod pure_item_extract {
     use crate::Borrowed;
 
-    /// Private trait for the "pure" borrowed-item extractor returned by
+    /// Private trait for the "pure" borrowed-item gate returned by
     /// [`FromPyObject::borrowed_item_extractor`](crate::FromPyObject).
     ///
     /// # Safety (pyo3-internal contract)
     ///
-    /// `extract_pure` must return `Ok(Some(_))` only for inputs whose
-    /// extraction cannot execute arbitrary Python code, so that the container
-    /// holding the borrowed element cannot be mutated while the borrow is
-    /// live (see the hook's documentation).
+    /// `is_pure_shape` must return `true` only for inputs whose extraction
+    /// cannot execute arbitrary Python code, so that the container holding
+    /// the borrowed element cannot be mutated while the borrow is live (see
+    /// the hook's documentation).
     #[doc(hidden)]
     pub trait PureItemExtract {
         type Target;
 
-        /// Extracts the item, or returns `Ok(None)` when the item's shape must
-        /// fall back to the owned (reference-counting) path.
-        fn extract_pure(
-            item: Borrowed<'_, '_, crate::PyAny>,
-        ) -> Result<Option<Self::Target>, crate::PyErr>;
+        /// Whether this item's shape can be extracted from a borrowed
+        /// pointer without executing arbitrary Python code. `false` means the
+        /// caller must use the owned (reference-counting) path.
+        fn is_pure_shape(item: Borrowed<'_, '_, crate::PyAny>) -> bool;
     }
 }
 
