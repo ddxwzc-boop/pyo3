@@ -6,7 +6,9 @@ use crate::{
     conversion::{FromPyObject, FromPyObjectOwned, FromPyObjectSequence, IntoPyObject},
     exceptions::PyTypeError,
     ffi,
-    types::{PyAnyMethods, PySequence, PyString},
+    types::{
+        PyAnyMethods, PyList, PyListMethods, PySequence, PyString, PyTuple, PyTupleMethods,
+    },
     Borrowed, CastError, PyResult, PyTypeInfo,
 };
 use crate::{Bound, PyAny, PyErr, Python};
@@ -93,6 +95,38 @@ fn extract_sequence<'py, T>(obj: Borrowed<'_, 'py, PyAny>) -> PyResult<Vec<T>>
 where
     T: FromPyObjectOwned<'py>,
 {
+    // Fast paths for exact `list` and `tuple` inputs, which iterate the
+    // elements directly by index instead of through the generic iterator
+    // protocol, avoiding the iterator object allocation and per-element
+    // virtual dispatch.
+    //
+    // Subclasses are deliberately excluded, so that overridden `__iter__` and
+    // `__getitem__` implementations continue to be honoured by the generic
+    // path below.
+    if PyList::is_exact_type_of(&obj) {
+        let list = unsafe { obj.cast_unchecked::<PyList>() };
+        let mut v = Vec::with_capacity(list.len());
+        // `list.iter()` re-checks bounds on every element, as `T::extract` can
+        // run arbitrary Python code which mutates the list. The iteration is
+        // bounded by the list's initial length, so elements appended to the
+        // list during extraction are not extracted (unlike the generic
+        // iterator path below, which follows CPython list-iterator semantics
+        // and observes appended elements).
+        for item in list.iter() {
+            v.push(item.extract::<T>().map_err(Into::into)?);
+        }
+        return Ok(v);
+    }
+    if PyTuple::is_exact_type_of(&obj) {
+        let tuple = unsafe { obj.cast_unchecked::<PyTuple>() };
+        // tuples are immutable, so their elements can be borrowed directly
+        let mut v = Vec::with_capacity(tuple.len());
+        for item in tuple.iter_borrowed() {
+            v.push(T::extract(item).map_err(Into::into)?);
+        }
+        return Ok(v);
+    }
+
     // Types that pass `PySequence_Check` usually implement enough of the sequence protocol
     // to support this function and if not, we will only fail extraction safely.
     let seq = unsafe {
@@ -113,7 +147,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::conversion::IntoPyObject;
-    use crate::types::{PyAnyMethods, PyBytes, PyBytesMethods, PyList};
+    use crate::types::{PyAnyMethods, PyBytes, PyBytesMethods, PyDict, PyList};
     use crate::Python;
 
     #[test]
@@ -170,6 +204,76 @@ mod tests {
         Python::attach(|py| {
             let v: Vec<i32> = py.eval(c"(1, 2)", None, None).unwrap().extract().unwrap();
             assert_eq!(v, [1, 2]);
+        });
+    }
+
+    #[test]
+    fn test_extract_list_to_vec() {
+        Python::attach(|py| {
+            let v: Vec<i32> = py.eval(c"[1, 2, 3]", None, None).unwrap().extract().unwrap();
+            assert_eq!(v, [1, 2, 3]);
+        });
+    }
+
+    #[test]
+    fn test_extract_list_subclass_to_vec() {
+        Python::attach(|py| {
+            // a `list` subclass may override `__iter__`; the fast path for
+            // exact lists must not bypass it
+            let obj = py
+                .eval(
+                    c"type('L', (list,), {'__iter__': lambda self: iter([7, 8, 9])})()",
+                    None,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(obj.extract::<Vec<i32>>().unwrap(), [7, 8, 9]);
+        });
+    }
+
+    #[test]
+    fn test_extract_vec_from_list_mutated_during_extract() {
+        Python::attach(|py| {
+            // `T::extract` can run arbitrary Python code which mutates the
+            // list; extraction must stay within the shrinking bounds instead
+            // of reading out of bounds
+            let globals = PyDict::new(py);
+            py.run(
+                c"class Evil:
+    def __index__(self):
+        lst.pop()
+        return 0
+lst = [Evil() for _ in range(6)]",
+                Some(&globals),
+                Some(&globals),
+            )
+            .unwrap();
+            let obj = py.eval(c"lst", Some(&globals), Some(&globals)).unwrap();
+            assert_eq!(obj.extract::<Vec<i64>>().unwrap(), [0, 0, 0]);
+        });
+    }
+
+    #[test]
+    fn test_extract_vec_from_list_appended_during_extract() {
+        Python::attach(|py| {
+            // elements appended to the list during its own extraction are
+            // not extracted: iteration is bounded by the initial length
+            // (the generic iterator path would observe them, and would not
+            // terminate if every extraction appends an element)
+            let globals = PyDict::new(py);
+            py.run(
+                c"class Evil:
+    def __index__(self):
+        if len(lst) < 6:
+            lst.append(Evil())
+        return 0
+lst = [Evil(), Evil(), Evil()]",
+                Some(&globals),
+                Some(&globals),
+            )
+            .unwrap();
+            let obj = py.eval(c"lst", Some(&globals), Some(&globals)).unwrap();
+            assert_eq!(obj.extract::<Vec<i64>>().unwrap(), [0, 0, 0]);
         });
     }
 
