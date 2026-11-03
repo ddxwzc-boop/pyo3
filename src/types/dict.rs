@@ -76,6 +76,37 @@ impl PyDict {
         unsafe { ffi::PyDict_New().assume_owned(py).cast_into_unchecked() }
     }
 
+    /// Creates a new empty dictionary, reserving capacity for `size` entries.
+    ///
+    /// This is a performance hint: inserting more than `size` entries will grow
+    /// the dictionary as usual. Backed by the CPython private
+    /// `_PyDict_NewPresized` API (de-facto stable for over a decade and also
+    /// used by Cython), which caps the presize itself (tables above ~87k usable
+    /// entries are not fully preallocated); on the limited API, PyPy and GraalPy
+    /// this falls back to [`PyDict::new`] and ignores `size`.
+    pub fn new_presized(py: Python<'_>, size: usize) -> PyResult<Bound<'_, PyDict>> {
+        #[cfg(all(not(Py_LIMITED_API), not(PyPy), not(GraalPy)))]
+        {
+            // A plain cast would wrap `usize` values above `isize::MAX` to a
+            // negative size, which CPython buckets to the empty-dict path,
+            // silently losing the presize; saturate instead. CPython handles
+            // the remaining clamping itself.
+            let size = size.min(Py_ssize_t::MAX as usize) as Py_ssize_t;
+            // Safety: _PyDict_NewPresized returns a new owned dict on success,
+            // and NULL with an error set on failure.
+            unsafe {
+                ffi::_PyDict_NewPresized(size)
+                    .assume_owned_or_err(py)
+                    .cast_into_unchecked()
+            }
+        }
+        #[cfg(any(Py_LIMITED_API, PyPy, GraalPy))]
+        {
+            let _ = size;
+            Ok(Self::new(py))
+        }
+    }
+
     /// Creates a new dictionary from the sequence given.
     ///
     /// The sequence must consist of `(PyObject, PyObject)`. This is
@@ -785,8 +816,16 @@ where
     I: IntoIterator<Item = T>,
 {
     fn into_py_dict(self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let dict = PyDict::new(py);
-        self.into_iter().try_for_each(|item| {
+        let mut iter = self.into_iter();
+        let lower = iter.size_hint().0;
+        // presize the keys table from the size hint's lower bound to avoid
+        // repeated rehashing as the dict grows
+        let dict = if lower > 0 {
+            PyDict::new_presized(py, lower)?
+        } else {
+            PyDict::new(py)
+        };
+        iter.try_for_each(|item| {
             let (key, value) = item.unpack();
             dict.set_item(key, value)
         })?;
@@ -1674,5 +1713,64 @@ mod tests {
             let dict = [(1, 1), (2, 2), (3, 3)].into_py_dict(py).unwrap();
             assert_eq!(dict.iter().count(), 3);
         })
+    }
+
+    #[test]
+    fn test_new_presized() {
+        Python::attach(|py| {
+            for size in [0, 1, 1024] {
+                let dict = PyDict::new_presized(py, size).unwrap();
+                for i in 0..size {
+                    dict.set_item(i as i32, i as i32 * 2).unwrap();
+                }
+                assert_eq!(size, dict.len());
+                for i in 0..size {
+                    assert_eq!(
+                        i as i32 * 2,
+                        dict.get_item(i as i32)
+                            .unwrap()
+                            .unwrap()
+                            .extract::<i32>()
+                            .unwrap()
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_into_py_dict_exact_size_hint() {
+        Python::attach(|py| {
+            let dict = (0..1000).map(|i| (i, i * 2)).into_py_dict(py).unwrap();
+            assert_eq!(1000, dict.len());
+            assert_eq!(
+                1998,
+                dict.get_item(999)
+                    .unwrap()
+                    .unwrap()
+                    .extract::<i32>()
+                    .unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn test_into_py_dict_lower_bound_zero() {
+        Python::attach(|py| {
+            let dict = (0..1000)
+                .filter(|i| i % 2 == 0)
+                .map(|i| (i, i * 2))
+                .into_py_dict(py)
+                .unwrap();
+            assert_eq!(500, dict.len());
+            assert_eq!(
+                1000,
+                dict.get_item(500)
+                    .unwrap()
+                    .unwrap()
+                    .extract::<i32>()
+                    .unwrap()
+            );
+        });
     }
 }
