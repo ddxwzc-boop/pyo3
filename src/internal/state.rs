@@ -312,13 +312,27 @@ fn get_pool() -> &'static ReferencePool {
 fn drop_deferred_references(_py: Python<'_>) {
     #[cfg(not(pyo3_disable_reference_pool))]
     {
-        // Take the thread-local buffer (including its allocation, to be reused
-        // below) out of thread-local storage, dropping the borrow before any
-        // reference counts are decreased, so that `__del__` handlers which run
-        // during the decrefs cannot observe a mutably-borrowed buffer.
-        let mut batch = TLS_PENDING_DECREFS
-            .try_with(|pending| pending.borrow_mut().take())
-            .unwrap_or_default();
+        // Fast path: the steady state for an attach is that nothing is pending
+        // either in this thread's buffer or in the global pool. Probing the
+        // thread-local buffer with a single read is much cheaper than the
+        // drain below, which must take the buffer (and its allocation) out of
+        // thread-local storage so that reference counts can be decreased
+        // outside of the thread-local borrow.
+        let mut batch = if TLS_PENDING_DECREFS
+            .try_with(|pending| pending.borrow().0.is_empty())
+            .unwrap_or(true)
+        {
+            PyObjVec::new()
+        } else {
+            // Take the thread-local buffer (including its allocation, to be reused
+            // below) out of thread-local storage, dropping the borrow before any
+            // reference counts are decreased, so that `__del__` handlers which run
+            // during the decrefs cannot observe a mutably-borrowed buffer.
+            TLS_PENDING_DECREFS
+                .try_with(|pending| pending.borrow_mut().take())
+                .unwrap_or_default()
+        };
+        let took_from_tls = !batch.is_empty();
 
         // SAFETY: all pointers in the batch are owned references which were
         // handed over to the pool by `register_decref`.
@@ -343,13 +357,17 @@ fn drop_deferred_references(_py: Python<'_>) {
 
         // Return the batch's allocation to the thread-local buffer to avoid
         // reallocating on the next drop, unless the buffer was refilled in the
-        // meantime (e.g. by a `__del__` handler which detached).
-        let _ = TLS_PENDING_DECREFS.try_with(|pending| {
-            let mut pending = pending.borrow_mut();
-            if pending.0.is_empty() {
-                pending.0 = batch;
-            }
-        });
+        // meantime (e.g. by a `__del__` handler which detached). When the
+        // buffer was empty to begin with there is no allocation to return;
+        // the pool's spare batch (if the swap above ran) is simply dropped.
+        if took_from_tls {
+            let _ = TLS_PENDING_DECREFS.try_with(|pending| {
+                let mut pending = pending.borrow_mut();
+                if pending.0.is_empty() {
+                    pending.0 = batch;
+                }
+            });
+        }
     }
 }
 
