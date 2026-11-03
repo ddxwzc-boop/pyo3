@@ -137,29 +137,20 @@ impl<'py> FromPyObject<'_, 'py> for BigInt {
             num_owned = nb_index(&ob)?;
             num_owned.as_borrowed()
         };
+        // fast path (CPython 3.11 and older): read the 30-bit digits directly,
+        // skipping the `_PyLong_NumBits` / `_PyLong_AsByteArray` FFI calls and
+        // the two's-complement byte round-trip
+        #[cfg(all(not(Py_LIMITED_API), not(Py_3_12), not(PyPy), not(GraalPy)))]
+        {
+            if cpython_uses_30bit_digits(num.py()) {
+                let (negative, digits) = unsafe { pylong_digit_parts(&num) };
+                let sign = if negative { Sign::Minus } else { Sign::Plus };
+                return Ok(BigInt::new(sign, u30_digits_to_limbs(digits)));
+            }
+        }
         #[cfg(not(Py_LIMITED_API))]
         {
-            let mut buffer = int_to_u32_vec::<true>(&num)?;
-            let sign = if buffer.last().copied().is_some_and(|last| last >> 31 != 0) {
-                // BigInt::new takes an unsigned array, so need to convert from two's complement
-                // flip all bits, 'subtract' 1 (by adding one to the unsigned array)
-                let mut elements = buffer.iter_mut();
-                for element in elements.by_ref() {
-                    *element = (!*element).wrapping_add(1);
-                    if *element != 0 {
-                        // if the element didn't wrap over, no need to keep adding further ...
-                        break;
-                    }
-                }
-                // ... so just two's complement the rest
-                for element in elements {
-                    *element = !*element;
-                }
-                Sign::Minus
-            } else {
-                Sign::Plus
-            };
-            Ok(BigInt::new(sign, buffer))
+            bigint_from_long_bytes(&num)
         }
         #[cfg(Py_LIMITED_API)]
         {
@@ -186,6 +177,18 @@ impl<'py> FromPyObject<'_, 'py> for BigUint {
             num_owned = nb_index(&ob)?;
             num_owned.as_borrowed()
         };
+        // fast path (CPython 3.11 and older): read the 30-bit digits directly
+        #[cfg(all(not(Py_LIMITED_API), not(Py_3_12), not(PyPy), not(GraalPy)))]
+        {
+            if cpython_uses_30bit_digits(num.py()) {
+                let (negative, digits) = unsafe { pylong_digit_parts(&num) };
+                if !negative {
+                    // negative input falls through to the FFI path to preserve
+                    // its exact error/magnitude semantics for unsigned conversion
+                    return Ok(BigUint::new(u30_digits_to_limbs(digits)));
+                }
+            }
+        }
         #[cfg(not(Py_LIMITED_API))]
         {
             let buffer = int_to_u32_vec::<false>(&num)?;
@@ -201,6 +204,107 @@ impl<'py> FromPyObject<'_, 'py> for BigUint {
             Ok(BigUint::from_bytes_le(bytes.as_bytes()))
         }
     }
+}
+
+#[cfg(any(test, all(not(Py_LIMITED_API), not(Py_3_12), not(PyPy), not(GraalPy))))]
+/// Repacks CPython's little-endian 30-bit digits into `BigUint`'s little-endian
+/// 32-bit limbs, trimmed of trailing zero limbs.
+fn u30_digits_to_limbs(digits: &[u32]) -> Vec<u32> {
+    if digits.is_empty() {
+        return Vec::new();
+    }
+    // `len - len / 16` is always >= `ceil(len * 30 / 32)` (exact for most
+    // lengths) and, unlike `len * 30`, cannot overflow on 32-bit targets.
+    let mut limbs = Vec::with_capacity(digits.len() - digits.len() / 16);
+    // Stream the digits through a 64-bit accumulator, emitting one limb each
+    // time 32 bits have accumulated.
+    let mut acc: u64 = 0;
+    let mut acc_bits: u32 = 0;
+    for &digit in digits {
+        acc |= u64::from(digit) << acc_bits;
+        acc_bits += 30;
+        while acc_bits >= 32 {
+            limbs.push(acc as u32);
+            acc >>= 32;
+            acc_bits -= 32;
+        }
+    }
+    if acc_bits > 0 {
+        limbs.push(acc as u32);
+    }
+    // A nonzero topmost digit still leaves at most one trailing zero limb
+    // (e.g. `[1, 1]` emits two limbs where one suffices); trimming also
+    // normalizes degenerate all-zero input.
+    while limbs.last() == Some(&0) {
+        limbs.pop();
+    }
+    limbs
+}
+
+#[cfg(all(not(Py_LIMITED_API), not(Py_3_12), not(PyPy), not(GraalPy)))]
+/// CPython's `struct _longobject` for Python 3.11 and older:
+/// `PyObject_VAR_HEAD` followed by 30-bit `ob_digit[]`.
+#[repr(C)]
+struct PyLongObject311 {
+    ob_base: crate::ffi::PyVarObject,
+    ob_digit: [u32; 1],
+}
+
+#[cfg(all(not(Py_LIMITED_API), not(Py_3_12), not(PyPy), not(GraalPy)))]
+const _: () = assert!(
+    core::mem::offset_of!(PyLongObject311, ob_digit)
+        == core::mem::size_of::<crate::ffi::PyVarObject>()
+);
+
+#[cfg(all(not(Py_LIMITED_API), not(Py_3_12), not(PyPy), not(GraalPy)))]
+/// Reads the sign and the 30-bit digits directly out of a CPython
+/// `PyLongObject` (Python 3.11 and older layout).
+///
+/// This skips the `_PyLong_NumBits` and `_PyLong_AsByteArray` FFI calls, which
+/// repack the same digits byte-by-byte on the C side and round-trip negative
+/// values through a two's-complement byte array.
+///
+/// # Safety
+///
+/// `long` must be a valid `PyLongObject` (or subclass instance) allocated by
+/// CPython with the Python 3.11-and-older layout, and
+/// [`cpython_uses_30bit_digits`] must have returned `true` for the running
+/// interpreter. The returned slice borrows from `long`.
+#[inline]
+unsafe fn pylong_digit_parts<'a>(long: &'a Bound<'_, PyInt>) -> (bool, &'a [u32]) {
+    let obj: &PyLongObject311 = unsafe { &*long.as_ptr().cast_const().cast() };
+    let ob_size = obj.ob_base.ob_size;
+    let ndigits = ob_size.unsigned_abs();
+    if ndigits == 0 {
+        // `ob_size == 0` means the value is zero and CPython leaves
+        // `ob_digit[0]` undefined; read nothing.
+        return (false, &[]);
+    }
+    // `ob_size` reflects the actual allocation, so `ndigits` 30-bit digits
+    // starting at `ob_digit` are all readable.
+    let digits = unsafe { core::slice::from_raw_parts(obj.ob_digit.as_ptr(), ndigits) };
+    (ob_size < 0, digits)
+}
+
+#[cfg(all(not(Py_LIMITED_API), not(Py_3_12), not(PyPy), not(GraalPy)))]
+/// One-time check that the running CPython uses the documented 30-bit /
+/// 4-byte digit layout (`sys.int_info`), guarding against nonstandard
+/// 15-digit builds. Returns `false` on any failure so that callers fall back
+/// to the FFI path.
+fn cpython_uses_30bit_digits(py: Python<'_>) -> bool {
+    use crate::types::any::PyAnyMethods;
+    use crate::types::PyModule;
+
+    static LAYOUT_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LAYOUT_OK.get_or_init(|| {
+        let check = || -> crate::PyResult<bool> {
+            let int_info = PyModule::import(py, "sys")?.getattr("int_info")?;
+            let bits_per_digit: i64 = int_info.getattr("bits_per_digit")?.extract()?;
+            let sizeof_digit: i64 = int_info.getattr("sizeof_digit")?.extract()?;
+            Ok(bits_per_digit == 30 && sizeof_digit == 4)
+        };
+        check().unwrap_or(false)
+    })
 }
 
 #[cfg(not(any(Py_LIMITED_API, Py_3_13)))]
@@ -273,6 +377,32 @@ fn int_to_u32_vec<const SIGNED: bool>(long: &Bound<'_, PyInt>) -> PyResult<Vec<u
         .for_each(|chunk| *chunk = u32::from_le(*chunk));
 
     Ok(buffer)
+}
+
+#[cfg(not(Py_LIMITED_API))]
+/// Extracts a `BigInt` via the portable `_PyLong_AsByteArray` FFI path.
+fn bigint_from_long_bytes(long: &Bound<'_, PyInt>) -> PyResult<BigInt> {
+    let mut buffer = int_to_u32_vec::<true>(long)?;
+    let sign = if buffer.last().copied().is_some_and(|last| last >> 31 != 0) {
+        // BigInt::new takes an unsigned array, so need to convert from two's complement
+        // flip all bits, 'subtract' 1 (by adding one to the unsigned array)
+        let mut elements = buffer.iter_mut();
+        for element in elements.by_ref() {
+            *element = (!*element).wrapping_add(1);
+            if *element != 0 {
+                // if the element didn't wrap over, no need to keep adding further ...
+                break;
+            }
+        }
+        // ... so just two's complement the rest
+        for element in elements {
+            *element = !*element;
+        }
+        Sign::Minus
+    } else {
+        Sign::Plus
+    };
+    Ok(BigInt::new(sign, buffer))
 }
 
 #[cfg(Py_LIMITED_API)]
@@ -350,6 +480,166 @@ mod tests {
             let f2 = f0.call_method1("__add__", (&f1,)).unwrap();
             Some(std::mem::replace(&mut f0, std::mem::replace(&mut f1, f2)))
         })
+    }
+
+    #[test]
+    fn u30_digits_to_limbs_edge_cases() {
+        // digits are CPython 30-bit digits (little-endian); expected values are
+        // num-bigint's 32-bit limbs (little-endian, trailing zeros trimmed).
+        let cases: &[(&[u32], &[u32])] = &[
+            (&[], &[]),  // zero
+            (&[0], &[]), // degenerate single zero digit
+            (&[1], &[1]),
+            (&[(1 << 30) - 1], &[(1 << 30) - 1]), // full single digit
+            (&[0, 1], &[1 << 30]),                // 2^30
+            (&[1, 1], &[(1 << 30) + 1]),          // 2^30 + 1
+            (&[(1 << 30) - 1, 3], &[u32::MAX]),   // 2^32 - 1
+            (&[0, 0, 1], &[0, 1 << 28]),          // 2^60
+            (&[1, 0, 1], &[1, 1 << 28]),          // 2^60 + 1
+            (&[0, 0, 8], &[0, 1 << 31]),          // 2^63 (= |i64::MIN|)
+        ];
+        for (digits, expected) in cases {
+            assert_eq!(&u30_digits_to_limbs(digits), expected, "digits: {digits:?}");
+        }
+    }
+
+    #[test]
+    fn u30_digits_to_limbs_matches_biguint_reference() {
+        // deterministic PRNG so failures are reproducible without external deps
+        struct XorShift(u64);
+        impl XorShift {
+            fn next_u64(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+        }
+        let mut rng = XorShift(0x5EED_1234_ABCD_0001);
+
+        // lengths up to 120 digits plus a few 10^3000-scale magnitudes
+        let lengths: Vec<usize> = (0..150)
+            .map(|_| 1 + (rng.next_u64() % 120) as usize)
+            .chain([333, 334, 340, 341, 350])
+            .collect();
+
+        for (case, &n_digits) in lengths.iter().enumerate() {
+            let mut digits: Vec<u32> = (0..n_digits)
+                .map(|_| (rng.next_u64() as u32) & ((1 << 30) - 1))
+                .collect();
+            // CPython invariant: the topmost digit of a nonzero int is nonzero
+            *digits.last_mut().unwrap() = 1 + (rng.next_u64() as u32) % ((1 << 30) - 1);
+
+            // reference: rebuild the value as a BigUint and take its limbs
+            let mut reference = BigUint::from(0u32);
+            for (i, &digit) in digits.iter().enumerate() {
+                reference += BigUint::from(digit) << (30 * i);
+            }
+            let expected = reference.to_u32_digits();
+
+            assert_eq!(
+                u30_digits_to_limbs(&digits),
+                expected,
+                "case {case} with {n_digits} digits"
+            );
+        }
+    }
+
+    /// Cross-validates the direct digit read against the FFI byte path on
+    /// CPython 3.11 and older (the only builds where the fast path exists).
+    #[cfg(all(not(Py_LIMITED_API), not(Py_3_12), not(PyPy), not(GraalPy)))]
+    #[test]
+    fn digit_fast_path_agrees_with_ffi_path() {
+        Python::attach(|py| {
+            if !cpython_uses_30bit_digits(py) {
+                // nonstandard digit layout (15-digit build): the fast path is
+                // disabled at runtime and there is nothing to cross-check here
+                return;
+            }
+            let mut values: Vec<BigInt> = vec![
+                BigInt::from(0),
+                BigInt::from(i64::MIN),
+                BigInt::from(i64::MAX),
+                BigInt::from(u64::MAX),
+                BigInt::from(i128::MIN),
+                BigInt::from(i128::MAX),
+                BigInt::from(u128::MAX),
+                BigInt::from(1) << 9966, // ~10^3000, huge-benchmark scale
+            ];
+            for i in 0..=1024usize {
+                values.push(BigInt::from(1) << i);
+                values.push(-BigInt::from(1) << i);
+                values.push((BigInt::from(1) << i) + 1u32);
+                values.push((BigInt::from(1) << i) - 1u32);
+                values.push((-BigInt::from(1) << i) - 1u32);
+            }
+            for value in values {
+                let obj = value.clone().into_pyobject(py).unwrap();
+
+                let (negative, digits) = unsafe { pylong_digit_parts(&obj) };
+                let fast = BigInt::new(
+                    if negative { Sign::Minus } else { Sign::Plus },
+                    u30_digits_to_limbs(digits),
+                );
+                assert_eq!(fast, value, "digit fast path disagrees for {value}");
+
+                let via_ffi = bigint_from_long_bytes(&obj).unwrap();
+                assert_eq!(via_ffi, value, "FFI path disagrees for {value}");
+            }
+
+            // int subclasses (bool and user subclasses) reach the fast path
+            // through the same `cast` above and must read identically
+            let mut subclass_cases: Vec<(BigInt, Bound<'_, PyInt>)> = vec![
+                (
+                    BigInt::from(1),
+                    py.eval(c"True", None, None)
+                        .unwrap()
+                        .cast_into::<PyInt>()
+                        .unwrap(),
+                ),
+                (
+                    BigInt::from(0),
+                    py.eval(c"False", None, None)
+                        .unwrap()
+                        .cast_into::<PyInt>()
+                        .unwrap(),
+                ),
+            ];
+            let subclass_code = c_str!("class MyInt(int):\n    pass\n");
+            let module = PyModule::from_code(
+                py,
+                subclass_code,
+                c"subclass_int.py",
+                &generate_unique_module_name("subclass_int"),
+            )
+            .unwrap();
+            for value in [BigInt::from(7), -BigInt::from(7), BigInt::from(1) << 200] {
+                let int_obj = value.clone().into_pyobject(py).unwrap();
+                let obj: Bound<'_, PyInt> = module
+                    .getattr("MyInt")
+                    .unwrap()
+                    .call1((int_obj,))
+                    .unwrap()
+                    .cast_into::<PyInt>()
+                    .unwrap();
+                subclass_cases.push((value, obj));
+            }
+            for (value, obj) in subclass_cases {
+                let (negative, digits) = unsafe { pylong_digit_parts(&obj) };
+                let fast = BigInt::new(
+                    if negative { Sign::Minus } else { Sign::Plus },
+                    u30_digits_to_limbs(digits),
+                );
+                assert_eq!(fast, value, "digit fast path disagrees for {value}");
+                assert_eq!(
+                    bigint_from_long_bytes(&obj).unwrap(),
+                    value,
+                    "FFI path disagrees for {value}"
+                );
+            }
+        });
     }
 
     #[test]
