@@ -17,7 +17,7 @@ use crate::types::{
 };
 use crate::{exceptions::PyBaseException, ffi};
 use crate::{BoundObject, Py, PyAny, Python};
-use err_state::{PyErrState, PyErrStateLazyFnOutput, PyErrStateNormalized};
+use err_state::{PyErrLazyArguments, PyErrState, PyErrStateLazyFnOutput, PyErrStateNormalized};
 use std::convert::Infallible;
 use std::ffi::CStr;
 
@@ -127,12 +127,24 @@ impl PyErr {
         T: PyTypeInfo,
         A: PyErrArguments + Send + Sync + 'static,
     {
-        PyErr::from_state(PyErrState::lazy(Box::new(move |py| {
-            PyErrStateLazyFnOutput {
-                ptype: T::type_object(py).into(),
-                pvalue: args.arguments(py),
-            }
-        })))
+        // Fast path: for message-like arguments, store the arguments inline in
+        // the lazy state to avoid the heap allocation (and later deallocation)
+        // of the boxed closure.
+        let state = match PyErrLazyArguments::try_from_args(args) {
+            Ok(args) => PyErrState::lazy_typed(
+                // Non-capturing closure, which coerces to a function pointer
+                // monomorphized over `T`.
+                |py| T::type_object(py).into(),
+                args,
+            ),
+            Err(args) => PyErrState::lazy(Box::new(move |py| {
+                PyErrStateLazyFnOutput {
+                    ptype: T::type_object(py).into(),
+                    pvalue: args.arguments(py),
+                }
+            })),
+        };
+        PyErr::from_state(state)
     }
 
     /// Constructs a new PyErr from the given Python type and arguments.

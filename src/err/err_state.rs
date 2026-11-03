@@ -1,4 +1,5 @@
 use std::{
+    any::TypeId,
     cell::UnsafeCell,
     sync::{Mutex, Once},
     thread::ThreadId,
@@ -30,16 +31,20 @@ unsafe impl crate::marker::Ungil for PyErrState {}
 
 impl PyErrState {
     pub(crate) fn lazy(f: Box<PyErrStateLazyFn>) -> Self {
-        Self::from_inner(PyErrStateInner::Lazy(f))
+        Self::from_inner(PyErrStateInner::Lazy(LazyState::Boxed(f)))
+    }
+
+    pub(crate) fn lazy_typed(ptype: PyErrTypeFn, args: PyErrLazyArguments) -> Self {
+        Self::from_inner(PyErrStateInner::Lazy(LazyState::Typed { ptype, args }))
     }
 
     pub(crate) fn lazy_arguments(ptype: Py<PyAny>, args: impl PyErrArguments + 'static) -> Self {
-        Self::from_inner(PyErrStateInner::Lazy(Box::new(move |py| {
-            PyErrStateLazyFnOutput {
+        Self::from_inner(PyErrStateInner::Lazy(LazyState::Boxed(Box::new(
+            move |py| PyErrStateLazyFnOutput {
                 ptype,
                 pvalue: args.arguments(py),
-            }
-        })))
+            },
+        ))))
     }
 
     pub(crate) fn normalized(normalized: PyErrStateNormalized) -> Self {
@@ -280,8 +285,103 @@ pub(crate) struct PyErrStateLazyFnOutput {
 pub(crate) type PyErrStateLazyFn =
     dyn for<'py> FnOnce(Python<'py>) -> PyErrStateLazyFnOutput + Send + Sync;
 
+/// Function pointer which produces the exception type object of a
+/// lazily-constructed exception.
+///
+/// This is monomorphized over the exception type `T` of `PyErr::new::<T, _>`;
+/// as a plain function pointer it can be stored inline in the lazy state
+/// without a heap allocation.
+pub(crate) type PyErrTypeFn = for<'py> fn(Python<'py>) -> Py<PyAny>;
+
+/// Arguments of a lazily-constructed exception, for the common case where they
+/// can be stored inline instead of being captured by a boxed closure.
+///
+/// This avoids the heap allocation (and later deallocation) of the closure for
+/// the overwhelmingly common `new_err("message")` and `new_err(format!(..))`
+/// constructions.
+pub(crate) enum PyErrLazyArguments {
+    /// `&'static str` message arguments.
+    StaticStr(&'static str),
+    /// `String` message arguments.
+    String(String),
+}
+
+impl PyErrLazyArguments {
+    /// Attempts to store `args` inline, avoiding a heap allocation.
+    ///
+    /// Returns `Err(args)` for argument types which are not supported inline,
+    /// so that the caller can fall back to the boxed-closure representation.
+    pub(crate) fn try_from_args<A: 'static>(args: A) -> Result<Self, A> {
+        if TypeId::of::<A>() == TypeId::of::<&'static str>() {
+            // SAFETY: `TypeId` equality proves that `A` is `&'static str`
+            // exactly. Although `TypeId` erases lifetimes, the `A: 'static`
+            // bound means that any lifetime parameter of `A` outlives
+            // `'static`, leaving `&'static str` as the only possibility.
+            Ok(Self::StaticStr(unsafe { assume_type::<A, &'static str>(args) }))
+        } else if TypeId::of::<A>() == TypeId::of::<String>() {
+            // SAFETY: `TypeId` equality proves that `A` is `String` exactly
+            // (it has no lifetime parameters).
+            Ok(Self::String(unsafe { assume_type::<A, String>(args) }))
+        } else {
+            Err(args)
+        }
+    }
+
+    fn arguments(self, py: Python<'_>) -> Py<PyAny> {
+        // Route through the same `PyErrArguments` implementations which the
+        // boxed-closure path uses, so that the produced arguments are
+        // identical.
+        match self {
+            Self::StaticStr(message) => PyErrArguments::arguments(message, py),
+            Self::String(message) => PyErrArguments::arguments(message, py),
+        }
+    }
+}
+
+/// Reinterprets `value` as type `T`.
+///
+/// # Safety
+///
+/// `A` and `T` must be the same type, e.g. as verified by comparing
+/// `TypeId::of::<A>()` with `TypeId::of::<T>()`.
+unsafe fn assume_type<A: 'static, T: 'static>(value: A) -> T {
+    debug_assert_eq!(TypeId::of::<A>(), TypeId::of::<T>());
+    // SAFETY: `A` and `T` are the same type, so this bitwise move reads a
+    // valid `T` from `value`'s memory.
+    let out = unsafe { std::ptr::read(&value as *const A as *const T) };
+    // The contents of `value` have been moved to `out`; it must not be dropped
+    // again as an `A`.
+    std::mem::forget(value);
+    out
+}
+
+/// Lazy state of an exception which has not yet been materialized.
+///
+/// `Typed` (function pointer + inline message arguments) is used by
+/// `PyErr::new` for message-like arguments; `Boxed` is the fallback for
+/// arbitrary arguments.
+enum LazyState {
+    Typed {
+        ptype: PyErrTypeFn,
+        args: PyErrLazyArguments,
+    },
+    Boxed(Box<PyErrStateLazyFn>),
+}
+
+impl LazyState {
+    fn into_output(self, py: Python<'_>) -> PyErrStateLazyFnOutput {
+        match self {
+            LazyState::Typed { ptype, args } => PyErrStateLazyFnOutput {
+                ptype: ptype(py),
+                pvalue: args.arguments(py),
+            },
+            LazyState::Boxed(f) => f(py),
+        }
+    }
+}
+
 enum PyErrStateInner {
-    Lazy(Box<PyErrStateLazyFn>),
+    Lazy(LazyState),
     Normalized(PyErrStateNormalized),
 }
 
@@ -338,7 +438,7 @@ impl PyErrStateInner {
 #[cfg(not(Py_3_12))]
 fn lazy_into_normalized_ffi_tuple(
     py: Python<'_>,
-    lazy: Box<PyErrStateLazyFn>,
+    lazy: LazyState,
 ) -> (*mut ffi::PyObject, *mut ffi::PyObject, *mut ffi::PyObject) {
     // To be consistent with 3.12 logic, go via raise_lazy, but also then normalize
     // the resulting exception
@@ -360,8 +460,8 @@ fn lazy_into_normalized_ffi_tuple(
 ///
 /// This would require either moving some logic from C to Rust, or requesting a new
 /// API in CPython.
-fn raise_lazy(py: Python<'_>, lazy: Box<PyErrStateLazyFn>) {
-    let PyErrStateLazyFnOutput { ptype, pvalue } = lazy(py);
+fn raise_lazy(py: Python<'_>, lazy: LazyState) {
+    let PyErrStateLazyFnOutput { ptype, pvalue } = lazy.into_output(py);
     unsafe {
         if ffi::PyExceptionClass_Check(ptype.as_ptr()) == 0 {
             ffi::PyErr_SetString(
@@ -378,7 +478,8 @@ fn raise_lazy(py: Python<'_>, lazy: Box<PyErrStateLazyFn>) {
 mod tests {
 
     use crate::{
-        exceptions::PyValueError, sync::PyOnceLock, Py, PyAny, PyErr, PyErrArguments, Python,
+        exceptions::PyValueError, sync::PyOnceLock, types::any::PyAnyMethods,
+        types::string::PyStringMethods, Py, PyAny, PyErr, PyErrArguments, Python,
     };
 
     #[test]
@@ -447,6 +548,147 @@ mod tests {
                 .get(py)
                 .expect("is set above")
                 .is_instance_of::<PyValueError>(py))
+        });
+    }
+
+    #[test]
+    fn test_lazy_typed_arguments_normalize_correctly() {
+        Python::attach(|py| {
+            // Inline `&'static str` fast path
+            let err = PyValueError::new_err("static message");
+            assert!(err.is_instance_of::<PyValueError>(py));
+            assert_eq!(err.value(py).str().unwrap().to_cow().unwrap(), "static message");
+
+            // Inline `String` fast path
+            let err = PyValueError::new_err(String::from("owned message"));
+            assert!(err.is_instance_of::<PyValueError>(py));
+            assert_eq!(
+                err.value(py).str().unwrap().to_cow().unwrap(),
+                "owned message"
+            );
+
+            // Fallback to the boxed-closure representation (tuple arguments)
+            let err = PyValueError::new_err(("tuple message", 42));
+            assert!(err.is_instance_of::<PyValueError>(py));
+            assert_eq!(
+                err.value(py).str().unwrap().to_cow().unwrap(),
+                "('tuple message', 42)"
+            );
+        });
+    }
+
+    #[test]
+    fn test_lazy_typed_arguments_restore() {
+        Python::attach(|py| {
+            // restore without a prior inspect exercises the restore path for
+            // the typed representation
+            let err = PyValueError::new_err("restore me");
+            err.restore(py);
+            let fetched = PyErr::fetch(py);
+            assert!(fetched.is_instance_of::<PyValueError>(py));
+            assert_eq!(fetched.value(py).str().unwrap().to_cow().unwrap(), "restore me");
+
+            let err = PyValueError::new_err(String::from("restore me too"));
+            err.restore(py);
+            let fetched = PyErr::fetch(py);
+            assert_eq!(
+                fetched.value(py).str().unwrap().to_cow().unwrap(),
+                "restore me too"
+            );
+        });
+    }
+
+    #[test]
+    fn test_lazy_typed_arguments_drop_without_normalize() {
+        // Constructing and dropping lazy errors without ever materializing
+        // them must be sound for both inline representations (in particular
+        // the `String` must be freed exactly once, without the GIL held).
+        drop(PyValueError::new_err(String::from("dropped unmaterialized")));
+        drop(PyValueError::new_err("dropped unmaterialized"));
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))] // We are building wasm Python with pthreads disabled
+    fn test_lazy_typed_arguments_multi_thread_normalize() {
+        static ERR: PyOnceLock<PyErr> = PyOnceLock::new();
+
+        Python::attach(|py| {
+            ERR.set(py, PyValueError::new_err("race")).unwrap();
+        });
+
+        // Many threads racing to normalize the same typed lazy state
+        let handles = (0..10)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    Python::attach(|py| {
+                        ERR.get(py).expect("is set just above").value(py);
+                    });
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        Python::attach(|py| {
+            assert!(ERR
+                .get(py)
+                .expect("is set above")
+                .is_instance_of::<PyValueError>(py))
+        });
+    }
+
+    #[test]
+    fn test_lazy_typed_arguments_display() {
+        // The inline representations must produce the same user-visible
+        // formatting as the boxed-closure path, both before and after
+        // normalization.
+        assert_eq!(
+            PyValueError::new_err("static display").to_string(),
+            "ValueError: static display"
+        );
+        assert_eq!(
+            PyValueError::new_err(String::from("owned display")).to_string(),
+            "ValueError: owned display"
+        );
+        let debug = format!("{:?}", PyValueError::new_err(String::from("debug me")));
+        assert!(
+            debug.contains("ValueError") && debug.contains("debug me"),
+            "unexpected Debug output: {debug}"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))] // We are building wasm Python with pthreads disabled
+    fn test_lazy_typed_string_multi_thread_normalize() {
+        // Variant of the above for the `String` representation, whose move /
+        // single-drop semantics under the `call_once` race are the easiest to
+        // silently break in future refactors (e.g. by adding `Clone`).
+        static ERR: PyOnceLock<PyErr> = PyOnceLock::new();
+
+        Python::attach(|py| {
+            ERR.set(py, PyValueError::new_err(String::from("race"))).unwrap();
+        });
+
+        let handles = (0..10)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    Python::attach(|py| {
+                        ERR.get(py).expect("is set just above").value(py);
+                    });
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        Python::attach(|py| {
+            let err = ERR.get(py).expect("is set above");
+            assert!(err.is_instance_of::<PyValueError>(py));
+            assert_eq!(err.value(py).str().unwrap().to_cow().unwrap(), "race");
         });
     }
 }
