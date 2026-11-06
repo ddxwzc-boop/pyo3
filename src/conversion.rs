@@ -463,6 +463,49 @@ pub trait FromPyObject<'a, 'py>: Sized {
         Option::<NeverASequence<Self>>::None
     }
 
+    /// Specialization hook for borrowed sequence extraction: returns `Some`
+    /// when extracting `Self` from a sequence element has a "pure" extractor,
+    /// i.e. one which is known not to execute arbitrary Python code for the
+    /// element shapes it accepts.
+    ///
+    /// The extractor returns `Ok(None)` for shapes which are not eligible, so
+    /// that the caller can fall back to the owned (reference-counting) path
+    /// for just those elements.
+    ///
+    /// This allows sequence extraction (e.g. `Vec<T>`, `HashMap<K, V>`) to
+    /// iterate by borrowed (reference-free) access instead of incrementing and
+    /// decrementing the reference count of every element, while remaining
+    /// sound: as long as extraction cannot run arbitrary Python code, the
+    /// sequence cannot be mutated mid-iteration and the borrowed element
+    /// pointers stay valid.
+    ///
+    /// # Safety (pyo3-internal contract)
+    ///
+    /// For every input for which the extractor returns `Ok(Some(_))`, the
+    /// extraction must not execute arbitrary Python code (in particular no
+    /// dunder dispatch such as `__index__` / `__float__`), so that the
+    /// container holding the borrowed elements cannot be mutated while the
+    /// borrow is live.
+    #[doc(hidden)]
+    #[inline(always)]
+    fn borrowed_item_extractor(
+        _: private::Token,
+    ) -> Option<impl PureItemExtract<Target = Self>> {
+        struct NeverPure<T>(PhantomData<T>);
+
+        impl<T> PureItemExtract for NeverPure<T> {
+            type Target = T;
+
+            #[inline(always)]
+            fn is_pure_shape(item: Borrowed<'_, '_, PyAny>) -> bool {
+                // never constructed: the default hook returns `None`
+                unreachable!("{item:?}")
+            }
+        }
+
+        Option::<NeverPure<Self>>::None
+    }
+
     /// Helper used to make a specialized path in extracting `DateTime<Tz>` where `Tz` is
     /// `chrono::Local`, which will accept "naive" datetime objects as being in the local timezone.
     #[cfg(feature = "chrono-local")]
@@ -488,6 +531,31 @@ mod from_py_object_sequence {
 
 // Only reachable / implementable inside PyO3 itself.
 pub(crate) use from_py_object_sequence::FromPyObjectSequence;
+
+mod pure_item_extract {
+    use crate::Borrowed;
+
+    /// Private trait for the "pure" borrowed-item gate returned by
+    /// [`FromPyObject::borrowed_item_extractor`](crate::FromPyObject).
+    ///
+    /// # Safety (pyo3-internal contract)
+    ///
+    /// `is_pure_shape` must return `true` only for inputs whose extraction
+    /// cannot execute arbitrary Python code, so that the container holding
+    /// the borrowed element cannot be mutated while the borrow is live (see
+    /// the hook's documentation).
+    #[doc(hidden)]
+    pub trait PureItemExtract {
+        type Target;
+
+        /// Whether this item's shape can be extracted from a borrowed
+        /// pointer without executing arbitrary Python code. `false` means the
+        /// caller must use the owned (reference-counting) path.
+        fn is_pure_shape(item: Borrowed<'_, '_, crate::PyAny>) -> bool;
+    }
+}
+
+pub(crate) use pure_item_extract::PureItemExtract;
 
 /// A data structure that can be extracted without borrowing any data from the input.
 ///

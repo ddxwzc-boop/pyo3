@@ -8,7 +8,7 @@ use crate::{
     conversion::IntoPyObject, instance::Bound, types::PyString, Borrowed, FromPyObject, PyAny,
     PyErr, Python,
 };
-use std::{borrow::Cow, convert::Infallible};
+use std::{borrow::Cow, convert::Infallible, marker::PhantomData};
 
 impl<'py> IntoPyObject<'py> for &str {
     type Target = PyString;
@@ -206,9 +206,70 @@ impl FromPyObject<'_, '_> for String {
         obj.cast::<PyString>()?.to_cow().map(Cow::into_owned)
     }
 
+    #[cfg(all(
+        not(Py_LIMITED_API),
+        not(PyPy),
+        not(GraalPy),
+        not(Py_GIL_DISABLED)
+    ))]
+    #[doc(hidden)]
+    #[inline(always)]
+    fn borrowed_item_extractor(
+        _: crate::conversion::private::Token,
+    ) -> Option<impl crate::conversion::PureItemExtract<Target = String>> {
+        Some(ExactStrExtractor(PhantomData))
+    }
+
     #[cfg(feature = "experimental-inspect")]
     fn type_input() -> TypeInfo {
         Self::type_output()
+    }
+}
+
+/// Whether `obj` is exactly a Python `str` (not a subclass).
+///
+/// Used by the borrowed sequence-extraction fast path: extracting a `String`
+/// from an exact `str` reads the character data directly and cannot execute
+/// arbitrary Python code, so the borrowed item pointer cannot be invalidated
+/// mid-extraction.
+#[cfg(all(
+    not(Py_LIMITED_API),
+    not(PyPy),
+    not(GraalPy),
+    not(Py_GIL_DISABLED)
+))]
+#[inline(always)]
+unsafe fn is_exact_str(obj: *mut crate::ffi::PyObject) -> bool {
+    unsafe { (*obj).ob_type == std::ptr::addr_of_mut!(crate::ffi::PyUnicode_Type) }
+}
+
+/// Borrowed-item extractor for `String` (see
+/// `FromPyObject::borrowed_item_extractor`). Returns `Ok(None)` for anything
+/// which is not an exact `str`, so that the caller falls back to the owned
+/// (reference-counting) path for that element.
+#[cfg(all(
+    not(Py_LIMITED_API),
+    not(PyPy),
+    not(GraalPy),
+    not(Py_GIL_DISABLED)
+))]
+pub(crate) struct ExactStrExtractor(PhantomData<String>);
+
+#[cfg(all(
+    not(Py_LIMITED_API),
+    not(PyPy),
+    not(GraalPy),
+    not(Py_GIL_DISABLED)
+))]
+impl crate::conversion::PureItemExtract for ExactStrExtractor {
+    type Target = String;
+
+    #[inline(always)]
+    fn is_pure_shape(item: Borrowed<'_, '_, PyAny>) -> bool {
+        // SAFETY (per the `PureItemExtract` contract): for exact `str`
+        // inputs extraction cannot run arbitrary Python code (the `cast` is
+        // a plain type check, and `to_cow` reads the character data).
+        unsafe { is_exact_str(item.as_ptr()) }
     }
 }
 

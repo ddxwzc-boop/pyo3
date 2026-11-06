@@ -76,6 +76,37 @@ impl PyDict {
         unsafe { ffi::PyDict_New().assume_owned(py).cast_into_unchecked() }
     }
 
+    /// Creates a new empty dictionary, reserving capacity for `size` entries.
+    ///
+    /// This is a performance hint: inserting more than `size` entries will grow
+    /// the dictionary as usual. Backed by the CPython private
+    /// `_PyDict_NewPresized` API (de-facto stable for over a decade and also
+    /// used by Cython), which caps the presize itself (tables above ~87k usable
+    /// entries are not fully preallocated); on the limited API, PyPy and GraalPy
+    /// this falls back to [`PyDict::new`] and ignores `size`.
+    pub fn new_presized(py: Python<'_>, size: usize) -> PyResult<Bound<'_, PyDict>> {
+        #[cfg(all(not(Py_LIMITED_API), not(PyPy), not(GraalPy)))]
+        {
+            // A plain cast would wrap `usize` values above `isize::MAX` to a
+            // negative size, which CPython buckets to the empty-dict path,
+            // silently losing the presize; saturate instead. CPython handles
+            // the remaining clamping itself.
+            let size = size.min(Py_ssize_t::MAX as usize) as Py_ssize_t;
+            // Safety: _PyDict_NewPresized returns a new owned dict on success,
+            // and NULL with an error set on failure.
+            unsafe {
+                ffi::_PyDict_NewPresized(size)
+                    .assume_owned_or_err(py)
+                    .cast_into_unchecked()
+            }
+        }
+        #[cfg(any(Py_LIMITED_API, PyPy, GraalPy))]
+        {
+            let _ = size;
+            Ok(Self::new(py))
+        }
+    }
+
     /// Creates a new dictionary from the sequence given.
     ///
     /// The sequence must consist of `(PyObject, PyObject)`. This is
@@ -396,6 +427,34 @@ impl<'a, 'py> Borrowed<'a, 'py, PyDict> {
     pub(crate) unsafe fn iter_borrowed(self) -> BorrowedDictIter<'a, 'py> {
         BorrowedDictIter::new(self)
     }
+
+    /// Variant of the owned [`BoundDictIterator`] which hands out borrowed
+    /// `(key, value)` pairs (no reference counting per entry), while keeping
+    /// the exact same mutation guards (and panics) as the owned iterator.
+    ///
+    /// This backs the borrowed dict-extraction fast path for element types
+    /// whose extraction is known not to execute arbitrary Python code.
+    ///
+    /// # Safety
+    /// The caller must guarantee that no arbitrary Python code runs while a
+    /// borrowed item from this iterator is live (e.g. because extraction of
+    /// the items is known to be pure), because mutating the dictionary would
+    /// invalidate the borrowed pointers.
+    #[cfg(all(
+        not(Py_LIMITED_API),
+        not(PyPy),
+        not(GraalPy),
+        not(Py_GIL_DISABLED)
+    ))]
+    pub(crate) unsafe fn iter_borrowed_guarded(self) -> GuardedBorrowedDictIter<'a, 'py> {
+        let len = dict_len(&self);
+        GuardedBorrowedDictIter {
+            dict: self,
+            ppos: 0,
+            di_used: len,
+            remaining: len,
+        }
+    }
 }
 
 fn dict_len(dict: &Bound<'_, PyDict>) -> Py_ssize_t {
@@ -682,6 +741,94 @@ impl<'py> BoundDictIterator<'py> {
     }
 }
 
+/// Variant of [`BoundDictIterator`] which yields borrowed `(key, value)`
+/// pairs without reference counting, with the same mutation guards (and
+/// panics) as the owned iterator.
+///
+/// Only used by the borrowed dict-extraction fast path (see
+/// [`Borrowed::iter_borrowed_guarded`]).
+#[cfg(all(
+    not(Py_LIMITED_API),
+    not(PyPy),
+    not(GraalPy),
+    not(Py_GIL_DISABLED)
+))]
+pub(crate) struct GuardedBorrowedDictIter<'a, 'py> {
+    dict: Borrowed<'a, 'py, PyDict>,
+    ppos: ffi::Py_ssize_t,
+    di_used: ffi::Py_ssize_t,
+    remaining: ffi::Py_ssize_t,
+}
+
+#[cfg(all(
+    not(Py_LIMITED_API),
+    not(PyPy),
+    not(GraalPy),
+    not(Py_GIL_DISABLED)
+))]
+impl<'a, 'py> Iterator for GuardedBorrowedDictIter<'a, 'py> {
+    type Item = (Borrowed<'a, 'py, PyAny>, Borrowed<'a, 'py, PyAny>);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let ma_used = dict_len(&self.dict);
+
+        // These checks (and their panics) mirror the owned
+        // `BoundDictIterator` / CPython's dict iterator: if the dict is
+        // mutated during iteration, this is detected between iterations.
+        if self.di_used != ma_used {
+            self.di_used = -1;
+            panic!("dictionary changed size during iteration");
+        };
+
+        if self.remaining == -1 {
+            self.di_used = -1;
+            panic!("dictionary keys changed during iteration");
+        };
+
+        let mut key: *mut ffi::PyObject = std::ptr::null_mut();
+        let mut value: *mut ffi::PyObject = std::ptr::null_mut();
+
+        if unsafe { ffi::PyDict_Next(self.dict.as_ptr(), &mut self.ppos, &mut key, &mut value) }
+            != 0
+        {
+            self.remaining -= 1;
+            let py = self.dict.py();
+            // Safety:
+            // - PyDict_Next returns borrowed values
+            // - we have already checked that `PyDict_Next` succeeded, so we can assume these to be non-null
+            // - the caller of `iter_borrowed_guarded` guarantees that no
+            //   arbitrary Python code runs while these borrows are live
+            Some(unsafe {
+                (
+                    key.assume_borrowed_unchecked(py),
+                    value.assume_borrowed_unchecked(py),
+                )
+            })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+#[cfg(all(
+    not(Py_LIMITED_API),
+    not(PyPy),
+    not(GraalPy),
+    not(Py_GIL_DISABLED)
+))]
+impl ExactSizeIterator for GuardedBorrowedDictIter<'_, '_> {
+    fn len(&self) -> usize {
+        self.remaining as usize
+    }
+}
+
 impl<'py> IntoIterator for Bound<'py, PyDict> {
     type Item = (Bound<'py, PyAny>, Bound<'py, PyAny>);
     type IntoIter = BoundDictIterator<'py>;
@@ -785,8 +932,16 @@ where
     I: IntoIterator<Item = T>,
 {
     fn into_py_dict(self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let dict = PyDict::new(py);
-        self.into_iter().try_for_each(|item| {
+        let mut iter = self.into_iter();
+        let lower = iter.size_hint().0;
+        // presize the keys table from the size hint's lower bound to avoid
+        // repeated rehashing as the dict grows
+        let dict = if lower > 0 {
+            PyDict::new_presized(py, lower)?
+        } else {
+            PyDict::new(py)
+        };
+        iter.try_for_each(|item| {
             let (key, value) = item.unpack();
             dict.set_item(key, value)
         })?;
@@ -1674,5 +1829,64 @@ mod tests {
             let dict = [(1, 1), (2, 2), (3, 3)].into_py_dict(py).unwrap();
             assert_eq!(dict.iter().count(), 3);
         })
+    }
+
+    #[test]
+    fn test_new_presized() {
+        Python::attach(|py| {
+            for size in [0, 1, 1024] {
+                let dict = PyDict::new_presized(py, size).unwrap();
+                for i in 0..size {
+                    dict.set_item(i as i32, i as i32 * 2).unwrap();
+                }
+                assert_eq!(size, dict.len());
+                for i in 0..size {
+                    assert_eq!(
+                        i as i32 * 2,
+                        dict.get_item(i as i32)
+                            .unwrap()
+                            .unwrap()
+                            .extract::<i32>()
+                            .unwrap()
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_into_py_dict_exact_size_hint() {
+        Python::attach(|py| {
+            let dict = (0..1000).map(|i| (i, i * 2)).into_py_dict(py).unwrap();
+            assert_eq!(1000, dict.len());
+            assert_eq!(
+                1998,
+                dict.get_item(999)
+                    .unwrap()
+                    .unwrap()
+                    .extract::<i32>()
+                    .unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn test_into_py_dict_lower_bound_zero() {
+        Python::attach(|py| {
+            let dict = (0..1000)
+                .filter(|i| i % 2 == 0)
+                .map(|i| (i, i * 2))
+                .into_py_dict(py)
+                .unwrap();
+            assert_eq!(500, dict.len());
+            assert_eq!(
+                1000,
+                dict.get_item(500)
+                    .unwrap()
+                    .unwrap()
+                    .extract::<i32>()
+                    .unwrap()
+            );
+        });
     }
 }

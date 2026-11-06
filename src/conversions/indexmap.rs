@@ -141,6 +141,28 @@ where
     fn extract(ob: Borrowed<'_, 'py, PyAny>) -> Result<Self, Self::Error> {
         let dict = ob.cast::<PyDict>()?;
         let mut ret = indexmap::IndexMap::with_capacity_and_hasher(dict.len(), S::default());
+        // Borrowed fast path (no incref/decref per entry) when both the key
+        // and value types have a pure item extractor.
+        #[cfg(all(
+            not(Py_LIMITED_API),
+            not(PyPy),
+            not(GraalPy),
+            not(Py_GIL_DISABLED)
+        ))]
+        if let (Some(key_extractor), Some(value_extractor)) = (
+            K::borrowed_item_extractor(crate::conversion::private::Token),
+            V::borrowed_item_extractor(crate::conversion::private::Token),
+        ) {
+            crate::conversions::std::map::extract_borrowed_dict_into(
+                &dict,
+                key_extractor,
+                value_extractor,
+                |k, v| {
+                    ret.insert(k, v);
+                },
+            )?;
+            return Ok(ret);
+        }
         for (k, v) in dict.iter() {
             ret.insert(
                 k.extract().map_err(Into::into)?,

@@ -91,4 +91,12 @@ harness = false
 name = "bench_pystring_from_fmt"
 harness = false
 
+[[bench]]
+name = "bench_vec"
+harness = false
+
+[[bench]]
+name = "bench_trampoline"
+harness = false
+
 [workspace]

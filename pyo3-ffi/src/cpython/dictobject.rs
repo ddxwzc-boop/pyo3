@@ -48,7 +48,13 @@ pub struct PyDictObject {
 // skipped PyDict_GET_SIZE
 // skipped PyDict_ContainsString
 
-// skipped private _PyDict_NewPresized
+extern "C" {
+    /// Private CPython API to create a dict with its keys table presized for
+    /// min_size entries. De-facto stable for over a decade; also used by Cython
+    /// and CPython internally.
+    #[cfg(not(any(PyPy, GraalPy)))]
+    pub fn _PyDict_NewPresized(min_size: Py_ssize_t) -> *mut PyObject;
+}
 
 // skipped PyDict_Pop
 // skipped PyDict_PopString

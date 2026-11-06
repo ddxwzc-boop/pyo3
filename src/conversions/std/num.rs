@@ -13,6 +13,7 @@ use crate::{exceptions, ffi, Borrowed, Bound, FromPyObject, PyAny, PyErr, PyResu
 use std::convert::Infallible;
 use std::ffi::c_long;
 use std::mem::MaybeUninit;
+use std::marker::PhantomData;
 use std::num::{
     NonZeroI128, NonZeroI16, NonZeroI32, NonZeroI64, NonZeroI8, NonZeroIsize, NonZeroU128,
     NonZeroU16, NonZeroU32, NonZeroU64, NonZeroU8, NonZeroUsize,
@@ -70,6 +71,20 @@ macro_rules! int_fits_larger_int {
                     .map_err(|e| exceptions::PyOverflowError::new_err(e.to_string()))
             }
 
+            #[cfg(all(
+                not(Py_LIMITED_API),
+                not(PyPy),
+                not(GraalPy),
+                not(Py_GIL_DISABLED)
+            ))]
+            #[doc(hidden)]
+            #[inline(always)]
+            fn borrowed_item_extractor(
+                _: crate::conversion::private::Token,
+            ) -> Option<impl crate::conversion::PureItemExtract<Target = Self>> {
+                Some(ExactIntExtractor(PhantomData))
+            }
+
             #[cfg(feature = "experimental-inspect")]
             fn type_input() -> TypeInfo {
                 <$larger_type>::type_input()
@@ -89,11 +104,25 @@ macro_rules! extract_int {
         // simplest logic for 3.10+ where that was fixed - python/cpython#82180.
         // `PyLong_AsUnsignedLongLong` does not call `PyNumber_Index`, hence the `force_index_call` argument
         // See https://github.com/PyO3/pyo3/pull/3742 for details
+        //
+        // Failure fast-path: an object whose type is neither an `int` (or subclass)
+        // nor defines `__index__` can never be converted to an integer. For such
+        // inputs fail lazily instead of entering the FFI conversion, which would
+        // construct a real exception inside the interpreter that is immediately
+        // fetched again and typically dropped without ever being observed.
         if cfg!(Py_3_10) && !$force_index_call {
-            err_if_invalid_value($obj.py(), $error_val, unsafe { $pylong_as($obj.as_ptr()) })
+            if unsafe { is_not_indexable($obj.as_ptr()) } {
+                Err(extract_int_type_error($obj))
+            } else {
+                err_if_invalid_value($obj.py(), $error_val, unsafe { $pylong_as($obj.as_ptr()) })
+            }
         } else if let Ok(long) = $obj.cast::<crate::types::PyInt>() {
             // fast path - checking for subclass of `int` just checks a bit in the type $object
             err_if_invalid_value($obj.py(), $error_val, unsafe { $pylong_as(long.as_ptr()) })
+        } else if unsafe { is_not_indexable($obj.as_ptr()) } {
+            // Lazy failure for the `nb_index` fallback: the type has no
+            // `__index__` slot, so `PyNumber_Index` is guaranteed to raise.
+            Err(extract_int_type_error($obj))
         } else {
             unsafe {
                 let num = nb_index(&$obj)?;
@@ -147,6 +176,20 @@ macro_rules! int_convert_u64_or_i64 {
 
             fn extract(obj: Borrowed<'_, '_, PyAny>) -> Result<$rust_type, Self::Error> {
                 extract_int!(obj, !0, $pylong_as_ll_or_ull, $force_index_call)
+            }
+
+            #[cfg(all(
+                not(Py_LIMITED_API),
+                not(PyPy),
+                not(GraalPy),
+                not(Py_GIL_DISABLED)
+            ))]
+            #[doc(hidden)]
+            #[inline(always)]
+            fn borrowed_item_extractor(
+                _: crate::conversion::private::Token,
+            ) -> Option<impl crate::conversion::PureItemExtract<Target = Self>> {
+                Some(ExactIntExtractor(PhantomData))
             }
 
             #[cfg(feature = "experimental-inspect")]
@@ -210,6 +253,20 @@ macro_rules! int_fits_c_long {
                 let val: c_long = extract_int!(obj, -1, ffi::PyLong_AsLong)?;
                 <$rust_type>::try_from(val)
                     .map_err(|e| exceptions::PyOverflowError::new_err(e.to_string()))
+            }
+
+            #[cfg(all(
+                not(Py_LIMITED_API),
+                not(PyPy),
+                not(GraalPy),
+                not(Py_GIL_DISABLED)
+            ))]
+            #[doc(hidden)]
+            #[inline(always)]
+            fn borrowed_item_extractor(
+                _: crate::conversion::private::Token,
+            ) -> Option<impl crate::conversion::PureItemExtract<Target = Self>> {
+                Some(ExactIntExtractor(PhantomData))
             }
 
             #[cfg(feature = "experimental-inspect")]
@@ -319,6 +376,20 @@ impl<'py> FromPyObject<'_, 'py> for u8 {
         } else {
             None
         }
+    }
+
+    #[cfg(all(
+        not(Py_LIMITED_API),
+        not(PyPy),
+        not(GraalPy),
+        not(Py_GIL_DISABLED)
+    ))]
+    #[doc(hidden)]
+    #[inline(always)]
+    fn borrowed_item_extractor(
+        _: crate::conversion::private::Token,
+    ) -> Option<impl crate::conversion::PureItemExtract<Target = u8>> {
+        Some(ExactIntExtractor(PhantomData))
     }
 }
 
@@ -667,6 +738,124 @@ fn err_if_invalid_value<T: PartialEq>(
     Ok(actual_value)
 }
 
+/// Whether an object's type is neither an `int` (or subclass) nor defines
+/// `__index__`, and thus can never be converted to an integer.
+///
+/// Reads the type slots directly (rather than via the `pyo3-ffi` helper
+/// functions) so that the check fully inlines into the extraction fast path.
+#[cfg(not(any(Py_LIMITED_API, GraalPy, PyPy, Py_GIL_DISABLED)))]
+#[inline(always)]
+unsafe fn is_not_indexable(obj: *mut ffi::PyObject) -> bool {
+    unsafe {
+        let ty = (*obj).ob_type;
+        ((*ty).tp_flags & ffi::Py_TPFLAGS_LONG_SUBCLASS) == 0
+            && ((*ty).tp_as_number.is_null() || (*(*ty).tp_as_number).nb_index.is_none())
+    }
+}
+
+// PyPy is included in the fallback (rather than the direct slot reads above):
+// its `nb_index` slot is not guaranteed to be materialized, so the FFI check
+// is the only reliable predicate. The free-threaded build also falls back to
+// the FFI check because `tp_flags` is atomic there.
+#[cfg(any(Py_LIMITED_API, GraalPy, PyPy, Py_GIL_DISABLED))]
+#[inline(always)]
+unsafe fn is_not_indexable(obj: *mut ffi::PyObject) -> bool {
+    // `PyIndex_Check` is declared for the limited API (3.8+) and PyPy; for
+    // abi3-py37 (limited API below 3.8) it is not available, so conservatively
+    // assume the object might be indexable and run the original conversion
+    // path unchanged.
+    #[cfg(not(all(Py_LIMITED_API, not(Py_3_8))))]
+    {
+        unsafe { ffi::PyLong_Check(obj) == 0 && ffi::PyIndex_Check(obj) == 0 }
+    }
+    #[cfg(all(Py_LIMITED_API, not(Py_3_8)))]
+    {
+        let _ = obj;
+        false
+    }
+}
+
+/// Whether `obj` is exactly a Python `int` (not a subclass).
+///
+/// Used by the borrowed sequence-extraction fast path: extracting an integer
+/// from an *exact* `int` reads the digit representation directly and cannot
+/// execute arbitrary Python code, so the borrowed item pointer cannot be
+/// invalidated mid-extraction.
+#[cfg(all(
+    not(Py_LIMITED_API),
+    not(PyPy),
+    not(GraalPy),
+    not(Py_GIL_DISABLED)
+))]
+#[inline(always)]
+pub(crate) unsafe fn is_exact_int(obj: *mut ffi::PyObject) -> bool {
+    unsafe { (*obj).ob_type == std::ptr::addr_of_mut!(ffi::PyLong_Type) }
+}
+
+/// Borrowed-item extractor for the integer family (see
+/// `FromPyObject::borrowed_item_extractor`). Returns `Ok(None)` for anything
+/// which is not an exact `int`, so that the caller falls back to the owned
+/// (reference-counting) path for that element.
+#[cfg(all(
+    not(Py_LIMITED_API),
+    not(PyPy),
+    not(GraalPy),
+    not(Py_GIL_DISABLED)
+))]
+pub(crate) struct ExactIntExtractor<T>(PhantomData<T>);
+
+#[cfg(all(
+    not(Py_LIMITED_API),
+    not(PyPy),
+    not(GraalPy),
+    not(Py_GIL_DISABLED)
+))]
+impl<T> crate::conversion::PureItemExtract for ExactIntExtractor<T>
+where
+    T: for<'a, 'py> FromPyObject<'a, 'py>,
+{
+    type Target = T;
+
+    #[inline(always)]
+    fn is_pure_shape(item: Borrowed<'_, '_, PyAny>) -> bool {
+        // SAFETY (per the `PureItemExtract` contract): for exact `int`
+        // inputs extraction cannot run arbitrary Python code.
+        unsafe { is_exact_int(item.as_ptr()) }
+    }
+}
+
+/// Constructs the `TypeError` returned when integer extraction is attempted
+/// on a type which can never be an integer. The message mirrors CPython's own
+/// message from `PyNumber_Index` failures (built from `tp_name`), and is
+/// stored inline in the lazy `PyErr` state without any heap closure.
+#[cfg(not(Py_LIMITED_API))]
+fn extract_int_type_error(obj: Borrowed<'_, '_, PyAny>) -> PyErr {
+    // Built by hand (rather than `format!`) to keep the failure path cheap;
+    // the message is byte-identical to CPython's own.
+    const SUFFIX: &str = "' object cannot be interpreted as an integer";
+    let type_name = unsafe { std::ffi::CStr::from_ptr((*ffi::Py_TYPE(obj.as_ptr())).tp_name) }
+        .to_string_lossy();
+    let mut message = String::with_capacity(type_name.len() + SUFFIX.len() + 1);
+    message.push('\'');
+    message.push_str(&type_name);
+    message.push_str(SUFFIX);
+    exceptions::PyTypeError::new_err(message)
+}
+
+#[cfg(Py_LIMITED_API)]
+fn extract_int_type_error(obj: Borrowed<'_, '_, PyAny>) -> PyErr {
+    use crate::types::{PyAnyMethods as _, PyStringMethods as _, PyTypeMethods as _};
+    let type_name = obj
+        .get_type()
+        .name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "<unknown>".to_owned());
+    exceptions::PyTypeError::new_err(format!(
+        "'{}' object cannot be interpreted as an integer",
+        type_name
+    ))
+}
+
 macro_rules! nonzero_int_impl {
     ($nonzero_type:ty, $primitive_type:ty) => {
         impl<'py> IntoPyObject<'py> for $nonzero_type {
@@ -717,6 +906,20 @@ macro_rules! nonzero_int_impl {
                 let val: $primitive_type = obj.extract()?;
                 <$nonzero_type>::try_from(val)
                     .map_err(|_| exceptions::PyValueError::new_err("invalid zero value"))
+            }
+
+            #[cfg(all(
+                not(Py_LIMITED_API),
+                not(PyPy),
+                not(GraalPy),
+                not(Py_GIL_DISABLED)
+            ))]
+            #[doc(hidden)]
+            #[inline(always)]
+            fn borrowed_item_extractor(
+                _: crate::conversion::private::Token,
+            ) -> Option<impl crate::conversion::PureItemExtract<Target = Self>> {
+                Some(ExactIntExtractor(PhantomData))
             }
 
             #[cfg(feature = "experimental-inspect")]
@@ -827,6 +1030,102 @@ mod test_128bit_integers {
             assert_eq!(v, obj.extract::<i128>().unwrap());
             assert_eq!(v as u128, obj.extract::<u128>().unwrap());
             assert!(obj.extract::<u64>().is_err());
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_extract_int_lazy_type_error() {
+        // A type without `__index__` (and not an `int`) fails lazily; the error
+        // is still a `TypeError` with a message mirroring CPython's
+        // `PyNumber_Index` failure.
+        Python::attach(|py| {
+            let obj = crate::types::PyDict::new(py).into_any();
+            let err = obj.extract::<i64>().unwrap_err();
+            assert!(err.is_instance_of::<crate::exceptions::PyTypeError>(py));
+            assert_eq!(
+                err.to_string(),
+                "TypeError: 'dict' object cannot be interpreted as an integer"
+            );
+        })
+    }
+
+    #[test]
+    fn test_extract_int_lazy_type_error_force_index_call() {
+        // Same for the `force_index_call` family (u64/usize).
+        Python::attach(|py| {
+            let obj = py
+                .eval(c"'not a number'", None, None)
+                .unwrap();
+            let err = obj.extract::<u64>().unwrap_err();
+            assert!(err.is_instance_of::<crate::exceptions::PyTypeError>(py));
+            assert_eq!(
+                err.to_string(),
+                "TypeError: 'str' object cannot be interpreted as an integer"
+            );
+        })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_extract_int_from_index_object() {
+        // Objects defining `__index__` (e.g. numpy scalars) are still accepted.
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                c"class WithIndex:
+    def __index__(self):
+        return 7
+obj = WithIndex()",
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let obj = locals.get_item("obj").unwrap().unwrap();
+            assert_eq!(obj.extract::<i64>().unwrap(), 7);
+            assert_eq!(obj.extract::<u64>().unwrap(), 7);
+        })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_extract_int_index_error_propagates() {
+        // An `__index__` which itself raises keeps propagating the original
+        // error from the interpreter (not the lazy fast-path error).
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                c"class BadIndex:
+    def __index__(self):
+        raise ValueError('boom')
+obj = BadIndex()",
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let obj = locals.get_item("obj").unwrap().unwrap();
+            let err = obj.extract::<i64>().unwrap_err();
+            assert!(err.is_instance_of::<crate::exceptions::PyValueError>(py));
+            let err = obj.extract::<u64>().unwrap_err();
+            assert!(err.is_instance_of::<crate::exceptions::PyValueError>(py));
+        })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_extract_int_from_int_subclass() {
+        // `int` subclasses (incl. `bool`) keep working through the fast path.
+        Python::attach(|py| {
+            let obj = py.eval(c"True", None, None).unwrap();
+            assert_eq!(obj.extract::<i64>().unwrap(), 1);
+            let locals = PyDict::new(py);
+            py.run(
+                c"class MyInt(int):
+    pass
+obj = MyInt(5)",
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let obj = locals.get_item("obj").unwrap().unwrap();
+            assert_eq!(obj.extract::<i64>().unwrap(), 5);
         })
     }
 
