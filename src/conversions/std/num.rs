@@ -90,16 +90,17 @@ macro_rules! extract_int {
         // `PyLong_AsUnsignedLongLong` does not call `PyNumber_Index`, hence the `force_index_call` argument
         // See https://github.com/PyO3/pyo3/pull/3742 for details
         //
-        // Failure fast-path: an object whose type is neither an `int` (or subclass)
-        // nor defines `__index__` can never be converted to an integer. For such
-        // inputs fail lazily instead of entering the FFI conversion, which would
-        // construct a real exception inside the interpreter that is immediately
-        // fetched again and typically dropped without ever being observed.
+        // On 3.10+ the success path is byte-identical to upstream: the
+        // conversion API is called directly and only its error sentinel
+        // (with an exception actually set) branches out to the cold
+        // classifier, which either returns the lazy error (for inputs which
+        // can never be index-converted) or fetches the real error.
         if cfg!(Py_3_10) && !$force_index_call {
-            if unsafe { is_not_indexable($obj.as_ptr()) } {
-                Err(extract_int_type_error($obj))
+            let value = unsafe { $pylong_as($obj.as_ptr()) };
+            if value == $error_val && unsafe { !ffi::PyErr_Occurred().is_null() } {
+                Err(extract_int_conversion_error($obj))
             } else {
-                err_if_invalid_value($obj.py(), $error_val, unsafe { $pylong_as($obj.as_ptr()) })
+                Ok(value)
             }
         } else if let Ok(long) = $obj.cast::<crate::types::PyInt>() {
             // fast path - checking for subclass of `int` just checks a bit in the type $object
@@ -718,11 +719,37 @@ unsafe fn is_not_indexable(obj: *mut ffi::PyObject) -> bool {
     }
 }
 
+/// Cold failure classifier for `extract_int!` on Python 3.10+: the conversion
+/// API returned its error sentinel with an exception set. If the input can
+/// never be index-converted (neither an `int` subclass nor `__index__`), the
+/// interpreter's `TypeError` is exactly the predictable one — clear it and
+/// return the lazy error instead of fetching and converting it. Otherwise
+/// this is a real conversion error (an exception raised by `__index__`
+/// itself, or an overflow) and is fetched and propagated unchanged.
+#[cold]
+#[inline(never)]
+fn extract_int_conversion_error(obj: Borrowed<'_, '_, PyAny>) -> PyErr {
+    if unsafe { is_not_indexable(obj.as_ptr()) } {
+        // SAFETY: an exception is set (verified by the caller) and the GIL is
+        // held; clearing it drops the never-observed `TypeError` the
+        // conversion just raised.
+        unsafe { ffi::PyErr_Clear() };
+        extract_int_type_error(obj)
+    } else {
+        // The caller verified an exception is set, so `take` cannot return
+        // `None` in practice; keep a well-defined fallback rather than
+        // panicking.
+        PyErr::take(obj.py()).unwrap_or_else(|| extract_int_type_error(obj))
+    }
+}
+
 /// Constructs the `TypeError` returned when integer extraction is attempted
 /// on a type which can never be an integer. The message mirrors CPython's own
 /// message from `PyNumber_Index` failures (built from `tp_name`), and is
 /// stored inline in the lazy `PyErr` state without any heap closure.
 #[cfg(not(Py_LIMITED_API))]
+#[cold]
+#[inline(never)]
 fn extract_int_type_error(obj: Borrowed<'_, '_, PyAny>) -> PyErr {
     // Built by hand (rather than `format!`) to keep the failure path cheap;
     // the message is byte-identical to CPython's own.
@@ -737,6 +764,8 @@ fn extract_int_type_error(obj: Borrowed<'_, '_, PyAny>) -> PyErr {
 }
 
 #[cfg(Py_LIMITED_API)]
+#[cold]
+#[inline(never)]
 fn extract_int_type_error(obj: Borrowed<'_, '_, PyAny>) -> PyErr {
     use crate::types::{PyAnyMethods as _, PyStringMethods as _, PyTypeMethods as _};
     let type_name = obj
