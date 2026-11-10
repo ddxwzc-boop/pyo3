@@ -95,6 +95,8 @@ impl PyErrState {
         Self::from_inner_init(PyErrStateInner::Normalized(normalized), NORMALIZED)
     }
 
+    #[cold]
+    #[inline(never)]
     pub(crate) fn restore(self, py: Python<'_>) {
         self.inner
             .into_inner()
@@ -210,6 +212,8 @@ impl PyErrState {
 
     /// Waits for the thread which is currently normalizing this state to
     /// complete, and then returns with the state `NORMALIZED`.
+    #[cold]
+    #[inline(never)]
     fn wait_until_normalized(&self, py: Python<'_>) {
         // Waiting for the normalizing thread from the normalizing thread
         // itself would deadlock.
@@ -303,16 +307,22 @@ impl PyErrStateNormalized {
     }
 
     #[cfg(not(Py_3_12))]
+    #[cold]
+    #[inline(never)]
     pub(crate) fn ptype<'py>(&self, py: Python<'py>) -> Bound<'py, PyType> {
         self.ptype.bind(py).clone()
     }
 
     #[cfg(Py_3_12)]
+    #[cold]
+    #[inline(never)]
     pub(crate) fn ptype<'py>(&self, py: Python<'py>) -> Bound<'py, PyType> {
         self.pvalue.bind(py).get_type()
     }
 
     #[cfg(not(Py_3_12))]
+    #[cold]
+    #[inline(never)]
     pub(crate) fn ptraceback<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyTraceback>> {
         self.ptraceback
             .as_ref()
@@ -320,6 +330,8 @@ impl PyErrStateNormalized {
     }
 
     #[cfg(Py_3_12)]
+    #[cold]
+    #[inline(never)]
     pub(crate) fn ptraceback<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyTraceback>> {
         unsafe {
             ffi::PyException_GetTraceback(self.pvalue.as_ptr())
@@ -328,6 +340,8 @@ impl PyErrStateNormalized {
         }
     }
 
+    #[cold]
+    #[inline(never)]
     pub(crate) fn take(py: Python<'_>) -> Option<PyErrStateNormalized> {
         #[cfg(Py_3_12)]
         {
@@ -379,6 +393,8 @@ impl PyErrStateNormalized {
     }
 
     #[cfg(not(Py_3_12))]
+    #[cold]
+    #[inline(never)]
     unsafe fn from_normalized_ffi_tuple(
         py: Python<'_>,
         ptype: *mut ffi::PyObject,
@@ -405,6 +421,8 @@ impl PyErrStateNormalized {
         }
     }
 
+    #[cold]
+    #[inline(never)]
     pub fn clone_ref(&self, py: Python<'_>) -> Self {
         Self {
             #[cfg(not(Py_3_12))]
@@ -574,6 +592,8 @@ impl PyErrStateInner {
     }
 
     #[cfg(not(Py_3_12))]
+    #[cold]
+    #[inline(never)]
     fn restore(self, py: Python<'_>) {
         let (ptype, pvalue, ptraceback) = match self {
             PyErrStateInner::Lazy(lazy) => lazy_into_normalized_ffi_tuple(py, lazy),
@@ -591,6 +611,8 @@ impl PyErrStateInner {
     }
 
     #[cfg(Py_3_12)]
+    #[cold]
+    #[inline(never)]
     fn restore(self, py: Python<'_>) {
         match self {
             PyErrStateInner::Lazy(lazy) => raise_lazy(py, lazy),
