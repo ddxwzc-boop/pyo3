@@ -2211,7 +2211,10 @@ impl<T> Clone for Py<T> {
 /// on the object by one if the thread is attached to the Python interpreter.
 ///
 /// Otherwise and by default, this registers the underlying pointer to have its reference count
-/// decremented the next time PyO3 attaches to the Python interpreter.
+/// decremented when the dropping thread next attaches to the Python interpreter. (Pending
+/// decrefs are buffered per-thread; if the buffer fills up, or the thread exits before
+/// draining it, they are handed over to a global pool from which any thread's next attach
+/// will release them.)
 ///
 /// However, if the `pyo3_disable_reference_pool` conditional compilation flag
 /// is enabled, it will abort the process.
