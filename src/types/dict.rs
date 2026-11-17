@@ -1,10 +1,14 @@
+use crate::conversion::FromPyObjectOwned;
 use crate::err::{self, PyErr, PyResult};
 use crate::ffi::Py_ssize_t;
 use crate::ffi_ptr_ext::FfiPtrExt;
 use crate::instance::{Borrowed, Bound};
 use crate::py_result_ext::PyResultExt;
+use crate::types::any::PyAnyMethods;
+use crate::types::fast_extract::{fast_or_pin, FastExtract, FastOrPinned};
 use crate::types::{PyAny, PyList, PyMapping};
 use crate::{ffi, BoundObject, IntoPyObject, IntoPyObjectExt, Python};
+use std::marker::PhantomData;
 
 /// Represents a Python `dict`.
 ///
@@ -203,6 +207,49 @@ pub trait PyDictMethods<'py>: crate::sealed::Sealed {
     /// so long as the set of keys does not change.
     fn iter(&self) -> BoundDictIterator<'py>;
 
+    /// Iterates over this dictionary, converting each `(key, value)` pair to
+    /// `(K, V)` on the fly.
+    ///
+    /// This is a safe alternative to taking a reference count per pair (which
+    /// is what [`iter`][PyDictMethods::iter] does by yielding owned items):
+    /// keys and values which are *exact* native objects (`int`, `float`) are
+    /// read directly inside the iterator step without any reference-count
+    /// change, while anything else (subclasses, custom `__index__` /
+    /// `__float__` implementors) is pinned — its reference count incremented —
+    /// *before* the conversion runs, so Python code which reenters during the
+    /// conversion cannot free it. Both members of a pair are pinned before
+    /// either conversion starts.
+    ///
+    /// The conversion of each member is exactly `member.extract()`, so error
+    /// behavior matches composing [`iter`][PyDictMethods::iter] with `extract`:
+    /// each step yields a `PyResult<(K, V)>`.
+    ///
+    /// The guards (and panic messages) match [`iter`][PyDictMethods::iter]:
+    /// panicking on size changes and on key-set changes during iteration.
+    ///
+    /// `K` and `V` must be native numeric types (see
+    /// [`FastExtract`](crate::types::iter::FastExtract)); other types can be
+    /// handled with `iter().map(|(k, v)| (k.extract(), v.extract()))`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use pyo3::prelude::*;
+    /// # Python::attach(|py| {
+    /// let dict = pyo3::types::PyDict::new(py);
+    /// dict.set_item(1, 10).unwrap();
+    /// dict.set_item(2, 20).unwrap();
+    /// let sum: i64 = dict.iter_extract::<i64, i64>()
+    ///     .map(|pair| pair.unwrap().0)
+    ///     .sum();
+    /// assert_eq!(sum, 3);
+    /// # });
+    /// ```
+    fn iter_extract<K, V>(&self) -> ExtractingDictIterator<'py, K, V>
+    where
+        K: FastExtract + FromPyObjectOwned<'py>,
+        V: FastExtract + FromPyObjectOwned<'py>;
+
     /// Iterates over the contents of this dictionary while holding a critical section on the dict.
     /// This is useful when the GIL is disabled and the dictionary is shared between threads.
     /// It is not guaranteed that the dictionary will not be modified during iteration when the
@@ -376,6 +423,14 @@ impl<'py> PyDictMethods<'py> for Bound<'py, PyDict> {
 
     fn iter(&self) -> BoundDictIterator<'py> {
         BoundDictIterator::new(self.clone())
+    }
+
+    fn iter_extract<K, V>(&self) -> ExtractingDictIterator<'py, K, V>
+    where
+        K: FastExtract + FromPyObjectOwned<'py>,
+        V: FastExtract + FromPyObjectOwned<'py>,
+    {
+        ExtractingDictIterator::new(self.clone())
     }
 
     fn locked_for_each<F>(&self, f: F) -> PyResult<()>
@@ -731,6 +786,187 @@ impl<'py> IntoIterator for &Bound<'py, PyDict> {
     }
 }
 
+/// Used by `PyDictMethods::iter_extract`.
+///
+/// Yields `PyResult<(K, V)>` values converted from the dict's entries without
+/// taking a reference count per pair: keys and values which are *exact* native
+/// objects (`int`, `float`) are read directly inside the iterator step (see
+/// [`FastExtract`](crate::types::iter::FastExtract)), and every other member
+/// is pinned — its reference count incremented — *before* the ordinary
+/// extraction machinery can call back into Python. Both members of a pair are
+/// fast-read-or-pinned before either conversion starts, so reentrant Python
+/// code (e.g. a `__index__` triggered by the conversion of a custom key)
+/// cannot free the not-yet-converted member of the current pair. Because of
+/// that pinning this is a safe API.
+///
+/// The guards (and panic messages) mirror the owned [`BoundDictIterator`]:
+/// panicking on size changes and on key-set changes during iteration.
+///
+/// Unlike the owned iterator, the `count` specialization is not carried over
+/// (`count()` uses the default `O(n)` walk instead of the owned iterator's
+/// `O(1)`), and neither are the free-threaded `fold`-family specializations.
+pub struct ExtractingDictIterator<'py, K, V> {
+    dict: Bound<'py, PyDict>,
+    inner: DictIterImpl,
+    _marker: PhantomData<fn() -> (K, V)>,
+}
+
+impl<'py, K: FastExtract + FromPyObjectOwned<'py>, V: FastExtract + FromPyObjectOwned<'py>>
+    ExtractingDictIterator<'py, K, V>
+{
+    fn new(dict: Bound<'py, PyDict>) -> Self {
+        let remaining = dict_len(&dict);
+
+        Self {
+            dict,
+            inner: DictIterImpl::DictIter {
+                ppos: 0,
+                di_used: remaining,
+                remaining,
+            },
+            _marker: PhantomData,
+        }
+    }
+
+    /// One guarded step: run the mutation guards, advance `PyDict_Next`, and
+    /// convert the yielded pair.
+    ///
+    /// # Safety
+    ///
+    /// On the free-threaded build, the dict's critical section must be held
+    /// (the caller wraps this in `with_critical_section`); on other builds the
+    /// GIL is held by the caller running this code.
+    #[deny(unsafe_op_in_unsafe_fn)]
+    #[inline]
+    unsafe fn next_pair_unchecked(
+        inner: &mut DictIterImpl,
+        dict: &Bound<'py, PyDict>,
+    ) -> Option<PyResult<(K, V)>> {
+        let py = dict.py();
+        match inner {
+            DictIterImpl::DictIter {
+                di_used,
+                remaining,
+                ppos,
+                ..
+            } => {
+                let ma_used = dict_len(dict);
+
+                // These checks are similar to what CPython does.
+                //
+                // If the dimension of the dict changes e.g. key-value pairs are removed
+                // or added during iteration, this will panic next time when `next` is called
+                if *di_used != ma_used {
+                    *di_used = -1;
+                    panic!("dictionary changed size during iteration");
+                };
+
+                // If the dict is changed in such a way that the length remains constant
+                // then this will panic at the end of iteration - similar to this:
+                //
+                // d = {"a":1, "b":2, "c": 3}
+                //
+                // for k, v in d.items():
+                //     d[f"{k}_"] = 4
+                //     del d[k]
+                //     print(k)
+                //
+                if *remaining == -1 {
+                    *di_used = -1;
+                    panic!("dictionary keys changed during iteration");
+                };
+
+                let mut key: *mut ffi::PyObject = std::ptr::null_mut();
+                let mut value: *mut ffi::PyObject = std::ptr::null_mut();
+
+                if unsafe { ffi::PyDict_Next(dict.as_ptr(), ppos, &mut key, &mut value) != 0 } {
+                    *remaining -= 1;
+                    // Phase 1: the reentrance-free window. Each member is read
+                    // via pure field reads when it is an exact native object,
+                    // or pinned (Py_INCREF) otherwise — neither branch can
+                    // call into the interpreter or allocate, so the unpinned
+                    // pointers cannot be freed while held. Both members are
+                    // handled before either conversion starts, so a reentry
+                    // from the key's conversion cannot free the value's
+                    // slot-of-origin before the value is pinned.
+                    // Safety: `PyDict_Next` succeeded, so these are live
+                    // non-null objects; see phase 1.
+                    let key_slot = unsafe { fast_or_pin::<K>(py, key) };
+                    let value_slot = unsafe { fast_or_pin::<V>(py, value) };
+                    // Phase 2: ordinary conversions. Reentrant Python code
+                    // may mutate the dict (the guards above police that on
+                    // the next step), but pinned members are kept alive by
+                    // the references taken in phase 1, and fast-read members
+                    // are already converted.
+                    let key = match key_slot {
+                        FastOrPinned::Fast(k) => k,
+                        FastOrPinned::Pinned(pinned) => match pinned.extract::<K>() {
+                            Ok(k) => k,
+                            Err(e) => return Some(Err(e.into())),
+                        },
+                    };
+                    let value = match value_slot {
+                        FastOrPinned::Fast(v) => v,
+                        FastOrPinned::Pinned(pinned) => match pinned.extract::<V>() {
+                            Ok(v) => v,
+                            Err(e) => return Some(Err(e.into())),
+                        },
+                    };
+                    Some(Ok((key, value)))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+impl<'py, K: FastExtract + FromPyObjectOwned<'py>, V: FastExtract + FromPyObjectOwned<'py>> Iterator
+    for ExtractingDictIterator<'py, K, V>
+{
+    type Item = PyResult<(K, V)>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        #[cfg(Py_GIL_DISABLED)]
+        {
+            let Self { dict, inner, .. } = self;
+            inner.with_critical_section(dict, |inner| unsafe {
+                Self::next_pair_unchecked(inner, dict)
+            })
+        }
+        #[cfg(not(Py_GIL_DISABLED))]
+        {
+            // Safety: the GIL is held by the caller running this code, so no
+            // other thread can mutate the dict during the step.
+            unsafe { Self::next_pair_unchecked(&mut self.inner, &self.dict) }
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl<'py, K: FastExtract + FromPyObjectOwned<'py>, V: FastExtract + FromPyObjectOwned<'py>>
+    ExactSizeIterator for ExtractingDictIterator<'py, K, V>
+{
+    /// Upper bound on the remaining items, computed from the entry count
+    /// captured at iterator creation: if the dict shrinks during iteration,
+    /// `len()` can be greater than the number of items `next()` will still
+    /// yield (the same approximation as the owned `BoundDictIterator`).
+    /// The saturating conversion is a deliberate deviation from the owned
+    /// iterator's raw cast, to avoid exposing the `-1` transient of the
+    /// equal-length key-change guard as a huge `len()`.
+    fn len(&self) -> usize {
+        match self.inner {
+            DictIterImpl::DictIter { remaining, .. } => remaining.max(0) as usize,
+        }
+    }
+}
+
 mod borrowed_iter {
     use super::*;
 
@@ -869,7 +1105,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{PyAnyMethods as _, PyTuple};
+    use crate::types::PyTuple;
     use std::collections::{BTreeMap, HashMap};
 
     #[test]
@@ -1771,6 +2007,199 @@ mod tests {
                     .extract::<i32>()
                     .unwrap()
             );
+        });
+    }
+
+    /// UT for `PyDictMethods::iter_extract` — same pairs as the owned iterator.
+    /// # Brief: build a 100_000-entry int→int dict, collect `iter_extract`
+    /// pairs and `iter()`+`extract` pairs, compare counts and order.
+    #[test]
+    fn iter_extract_yields_same_pairs_as_owned() {
+        Python::attach(|py| {
+            const LEN: usize = 100_000;
+            let mut map = std::collections::HashMap::new();
+            for i in 0..LEN {
+                map.insert(i as u64, (i as u64) * 2);
+            }
+            let dict = (&map).into_pyobject(py).unwrap();
+            let extracted: Vec<(u64, u64)> = dict
+                .iter_extract::<u64, u64>()
+                .map(|r| r.unwrap())
+                .collect();
+            let owned: Vec<(u64, u64)> = dict
+                .iter()
+                .map(|(k, v)| (k.extract().unwrap(), v.extract().unwrap()))
+                .collect();
+            assert_eq!(extracted.len(), LEN);
+            assert_eq!(extracted, owned);
+        });
+    }
+
+    /// UT for `PyDictMethods::iter_extract` — empty dict yields nothing.
+    #[test]
+    fn iter_extract_empty_dict() {
+        Python::attach(|py| {
+            let dict = PyDict::new(py);
+            let mut it = dict.iter_extract::<i64, i64>();
+            assert!(it.next().is_none());
+            assert_eq!(it.len(), 0);
+        });
+    }
+
+    /// UT for `ExtractingDictIterator` value replacement during iteration.
+    /// # Brief: iterate with `iter_extract`, `set_item` with the original
+    /// value plus 7; iteration completes without panicking and every value
+    /// ends up at original + 7 (mirroring the owned iterator's
+    /// `test_iter_value_mutated`).
+    #[test]
+    fn iter_extract_value_mutated() {
+        Python::attach(|py| {
+            let mut v = HashMap::new();
+            v.insert(7, 32);
+            v.insert(8, 42);
+            v.insert(9, 123);
+
+            let dict = (&v).into_pyobject(py).unwrap();
+
+            for (key, value) in dict.iter_extract::<i32, i32>().map(|r| r.unwrap()) {
+                dict.set_item(key, value + 7).unwrap();
+            }
+
+            assert_eq!(
+                dict.get_item(7).unwrap().unwrap().extract::<i32>().unwrap(),
+                39
+            );
+            assert_eq!(
+                dict.get_item(8).unwrap().unwrap().extract::<i32>().unwrap(),
+                49
+            );
+            assert_eq!(
+                dict.get_item(9).unwrap().unwrap().extract::<i32>().unwrap(),
+                130
+            );
+        });
+    }
+
+    /// UT for `ExtractingDictIterator` guard — inserting a key during
+    /// iteration panics.
+    #[test]
+    #[should_panic]
+    fn iter_extract_key_mutated() {
+        Python::attach(|py| {
+            let mut v = HashMap::new();
+            for i in 0..10 {
+                v.insert(i * 2, i * 2);
+            }
+            let dict = v.into_pyobject(py).unwrap();
+
+            for (i, (key, value)) in dict
+                .iter_extract::<i32, i32>()
+                .map(|r| r.unwrap())
+                .enumerate()
+            {
+                dict.set_item(key + 1, value + 1).unwrap();
+
+                if i > 1000 {
+                    // avoid this test just running out of memory if it fails
+                    break;
+                };
+            }
+        });
+    }
+
+    /// UT for `ExtractingDictIterator` guard — replacing keys at constant
+    /// length panics.
+    #[test]
+    #[should_panic]
+    fn iter_extract_key_mutated_constant_len() {
+        Python::attach(|py| {
+            let mut v = HashMap::new();
+            for i in 0..10 {
+                v.insert(i * 2, i * 2);
+            }
+            let dict = v.into_pyobject(py).unwrap();
+
+            for (i, (key, value)) in dict
+                .iter_extract::<i32, i32>()
+                .map(|r| r.unwrap())
+                .enumerate()
+            {
+                dict.del_item(key).unwrap();
+                dict.set_item(key + 1, value + 1).unwrap();
+
+                if i > 1000 {
+                    // avoid this test just running out of memory if it fails
+                    break;
+                };
+            }
+        });
+    }
+
+    /// UT for `ExtractingDictIterator` ExactSizeIterator tracking.
+    #[test]
+    fn iter_extract_exact_size() {
+        Python::attach(|py| {
+            let mut v = HashMap::new();
+            for i in 0..4 {
+                v.insert(i, i);
+            }
+            let dict = v.into_pyobject(py).unwrap();
+            let mut it = dict.iter_extract::<i64, i64>();
+            assert_eq!(it.len(), 4);
+            it.next().unwrap().unwrap();
+            it.next().unwrap().unwrap();
+            assert_eq!(it.len(), 2);
+        });
+    }
+
+    /// UT for `iter_extract` reentrancy hardening — a custom `__index__` key
+    /// replacing the current entry's value during conversion.
+    /// # Brief: `{Evil(): 1, 5: 6}` where `Evil.__index__` returns 42 and
+    /// replaces the value of its own entry with 9. The pinning slow path must
+    /// keep both members alive across the reentry, the yielded pair must be
+    /// `(42, 1)` (the value is pinned before the key's conversion runs), and
+    /// the final dict state must show the replacement. This is the exact
+    /// scenario which dangled with the unsafe `iter_borrowed` design.
+    #[test]
+    fn iter_extract_reentrant_value_replacement() {
+        Python::attach(|py| {
+            let class_def = cr#"
+class Evil:
+    def __index__(self):
+        target[target_key()] = 9
+        return 42
+
+def target_key():
+    for k in target:
+        return k
+"#;
+
+            let locals = crate::types::PyDict::new(py);
+            py.run(class_def, Some(&locals), None).unwrap();
+            let dict = py
+                .eval(c"{Evil(): 1, 5: 6}", Some(&locals), None)
+                .unwrap()
+                .cast_into::<PyDict>()
+                .unwrap();
+            locals.set_item("target", &dict).unwrap();
+
+            let pairs: Vec<(i64, i64)> = dict
+                .iter_extract::<i64, i64>()
+                .map(|r| r.unwrap())
+                .collect();
+            assert_eq!(pairs, vec![(42, 1), (5, 6)]);
+
+            // the reentry replaced the first entry's value; the new value
+            // must be visible afterwards without corrupting anything. (The
+            // key itself is the `Evil` instance; extracting it would reenter
+            // `__index__` again, so assert on the value only.)
+            let first_value = dict
+                .iter()
+                .next()
+                .map(|(_, v)| v.extract::<i64>().unwrap())
+                .unwrap();
+            assert_eq!(first_value, 9);
+            assert_eq!(dict.len(), 2);
         });
     }
 }
