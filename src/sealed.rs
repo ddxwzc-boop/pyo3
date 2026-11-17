@@ -59,6 +59,21 @@ impl<T: crate::pyclass::PyClass> Sealed for PyClassInitializer<T> {}
 
 impl Sealed for std::sync::Once {}
 impl<T> Sealed for std::sync::Mutex<T> {}
+
+// for FastExtract (safe zero-refcount extraction of native numeric items)
+impl Sealed for i8 {}
+impl Sealed for i16 {}
+impl Sealed for i32 {}
+impl Sealed for i64 {}
+impl Sealed for isize {}
+impl Sealed for u8 {}
+impl Sealed for u16 {}
+impl Sealed for u32 {}
+impl Sealed for u64 {}
+impl Sealed for usize {}
+impl Sealed for f32 {}
+impl Sealed for f64 {}
+
 #[cfg(feature = "lock_api")]
 impl<R, T> Sealed for lock_api::Mutex<R, T> {}
 #[cfg(feature = "parking_lot")]

@@ -5,15 +5,19 @@ use codspeed_criterion_compat::{criterion_group, criterion_main, Bencher, Criter
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PySequence};
 
+/// B-arm body of the D1 A/B pair: uses the safe extracting iterator
+/// (`iter_extract`, zero refcount per item on exact native items; pinned slow
+/// path otherwise). The A tree (pristine 0.28.2) runs the upstream
+/// owned-iterator body (`for x in &list { x.extract() }`) under the same
+/// point name; the two-tree paired diff is the optimization effect.
 fn iter_list(b: &mut Bencher<'_>) {
     Python::attach(|py| {
         const LEN: usize = 100_000;
         let list = PyList::new(py, 0..LEN).unwrap();
         let mut sum = 0;
         b.iter(|| {
-            for x in &list {
-                let i: u64 = x.extract().unwrap();
-                sum += i;
+            for i in list.iter_extract::<u64>() {
+                sum += i.unwrap();
             }
         });
     });
@@ -39,6 +43,8 @@ fn list_get_item(b: &mut Bencher<'_>) {
     });
 }
 
+/// B-arm body of the D1 `list_nth` A/B pair (same story as `iter_list`):
+/// the A tree (pristine 0.28.2) runs the upstream owned-iterator body.
 fn list_nth(b: &mut Bencher<'_>) {
     Python::attach(|py| {
         const LEN: usize = 50;
@@ -46,12 +52,13 @@ fn list_nth(b: &mut Bencher<'_>) {
         let mut sum = 0;
         b.iter(|| {
             for i in 0..LEN {
-                sum += list.iter().nth(i).unwrap().extract::<usize>().unwrap();
+                sum += list.iter_extract::<usize>().nth(i).unwrap().unwrap();
             }
         });
     });
 }
 
+/// B-arm body of the D1 `list_nth_back` A/B pair (same story as `iter_list`).
 fn list_nth_back(b: &mut Bencher<'_>) {
     Python::attach(|py| {
         const LEN: usize = 50;
@@ -59,7 +66,7 @@ fn list_nth_back(b: &mut Bencher<'_>) {
         let mut sum = 0;
         b.iter(|| {
             for i in 0..LEN {
-                sum += list.iter().nth_back(i).unwrap().extract::<usize>().unwrap();
+                sum += list.iter_extract::<usize>().nth_back(i).unwrap().unwrap();
             }
         });
     });
