@@ -47,6 +47,7 @@ pyobject_native_type_info!(
     "typing",
     "Any",
     Some("builtins"),
+    #static_type_object=true,
     #checkfunction=PyObject_Check
 );
 

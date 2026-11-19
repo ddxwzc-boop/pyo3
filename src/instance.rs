@@ -175,9 +175,9 @@ impl<'py, T> Bound<'py, T> {
                 // Safety: type_check is responsible for ensuring that the type is correct
                 Ok(unsafe { any.cast_unchecked() })
             } else {
-                Err(CastError::new(
+                Err(CastError::new_ref(
                     any.as_borrowed(),
-                    U::classinfo_object(any.py()),
+                    U::classinfo_object_ref(any.py()),
                 ))
             }
         }
@@ -222,8 +222,8 @@ impl<'py, T> Bound<'py, T> {
                 // Safety: type_check is responsible for ensuring that the type is correct
                 Ok(unsafe { any.cast_into_unchecked() })
             } else {
-                let to = U::classinfo_object(any.py());
-                Err(CastIntoError::new(any, to))
+                let classinfo = U::classinfo_object_ref(any.py());
+                Err(CastIntoError::new_ref(any, classinfo))
             }
         }
 
@@ -276,9 +276,9 @@ impl<'py, T> Bound<'py, T> {
                 // Safety: is_exact_instance_of is responsible for ensuring that the type is correct
                 Ok(unsafe { any.cast_unchecked() })
             } else {
-                Err(CastError::new(
+                Err(CastError::new_ref(
                     any.as_borrowed(),
-                    U::type_object(any.py()).into_any(),
+                    U::classinfo_object_ref(any.py()),
                 ))
             }
         }
@@ -301,8 +301,8 @@ impl<'py, T> Bound<'py, T> {
                 // Safety: is_exact_instance_of is responsible for ensuring that the type is correct
                 Ok(unsafe { any.cast_into_unchecked() })
             } else {
-                let to = U::type_object(any.py()).into_any();
-                Err(CastIntoError::new(any, to))
+                let classinfo = U::classinfo_object_ref(any.py());
+                Err(CastIntoError::new_ref(any, classinfo))
             }
         }
 
@@ -1032,7 +1032,7 @@ impl<'a, 'py, T> Borrowed<'a, 'py, T> {
                 // Safety: type_check is responsible for ensuring that the type is correct
                 Ok(unsafe { any.cast_unchecked() })
             } else {
-                Err(CastError::new(any, U::classinfo_object(any.py())))
+                Err(CastError::new_ref(any, U::classinfo_object_ref(any.py())))
             }
         }
         inner(self.to_any())
@@ -1061,7 +1061,7 @@ impl<'a, 'py, T> Borrowed<'a, 'py, T> {
                 // Safety: is_exact_instance_of is responsible for ensuring that the type is correct
                 Ok(unsafe { any.cast_unchecked() })
             } else {
-                Err(CastError::new(any, U::classinfo_object(any.py())))
+                Err(CastError::new_ref(any, U::classinfo_object_ref(any.py())))
             }
         }
         inner(self.to_any())
