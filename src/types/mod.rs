@@ -81,9 +81,10 @@ pub use self::weakref::{PyWeakref, PyWeakrefMethods, PyWeakrefProxy, PyWeakrefRe
 /// the Limited API and PyPy, the underlying structures are opaque and that may not be possible.
 /// In these cases the iterators are implemented by forwarding to [`PyIterator`].
 pub mod iter {
-    pub use super::dict::BoundDictIterator;
+    pub use super::dict::{BoundDictIterator, ExtractingDictIterator};
+    pub use super::fast_extract::FastExtract;
     pub use super::frozenset::BoundFrozenSetIterator;
-    pub use super::list::BoundListIterator;
+    pub use super::list::{BoundListIterator, ExtractingListIterator};
     pub use super::set::BoundSetIterator;
     pub use super::tuple::{BorrowedTupleIterator, BoundTupleIterator};
 }
@@ -160,15 +161,23 @@ macro_rules! pyobject_type_info_type_hint(
 /// - `$typeobject` must be a function that produces a valid `*mut PyTypeObject`
 /// - `$checkfunction` must be a function that accepts arbitrary `*mut PyObject` and returns true /
 ///   false according to whether the object is an instance of the type from `$typeobject`
+/// - `#static_type_object` must only be `true` if `$typeobject` produces a process-global static
+///   type object which is never deallocated for the process lifetime
 #[doc(hidden)]
 #[macro_export]
 macro_rules! pyobject_native_type_info(
-    ($name:ty, $typeobject:expr, $type_hint_module:expr, $type_hint_name:expr, $module:expr $(, #checkfunction=$checkfunction:path)? $(;$generics:ident)*) => {
+    ($name:ty, $typeobject:expr, $type_hint_module:expr, $type_hint_name:expr, $module:expr, #static_type_object=$static_type_object:literal $(, #checkfunction=$checkfunction:path)? $(;$generics:ident)*) => {
         // SAFETY: macro caller has upheld the safety contracts
         unsafe impl<$($generics,)*> $crate::type_object::PyTypeInfo for $name {
             const NAME: &'static str = stringify!($name);
             const MODULE: ::std::option::Option<&'static str> = $module;
             $crate::pyobject_type_info_type_hint!($type_hint_module, $type_hint_name);
+
+            /// Whether `type_object_raw` produces a process-global static type
+            /// object which is never deallocated for the process lifetime; this
+            /// drives the zero-refcount borrowed classinfo of cast errors.
+            #[doc(hidden)]
+            const TYPE_OBJECT_IS_STATIC: bool = $static_type_object && cfg!(not(any(PyPy, GraalPy)));
 
             #[inline]
             #[allow(clippy::redundant_closure_call)]
@@ -201,12 +210,23 @@ macro_rules! pyobject_native_type_info(
 #[doc(hidden)]
 #[macro_export]
 macro_rules! pyobject_native_type_core {
+    // Static type-object marker form: these arms must precede the general
+    // arms of the same shape, because the general `$typeobject:expr` matcher
+    // also accepts the marker macro call (mis-ordering would silently fall
+    // back to the owned classinfo form).
+    ($name:ty, pyobject_native_static_type_object!($typeobject:expr), $type_hint_module:expr, $type_hint_name:expr, #module=$module:expr $(, #checkfunction=$checkfunction:path)? $(;$generics:ident)*) => {
+        $crate::pyobject_native_type_named!($name $(;$generics)*);
+        $crate::pyobject_native_type_info!($name, pyobject_native_static_type_object!($typeobject), $type_hint_module, $type_hint_name, $module, #static_type_object=true $(, #checkfunction=$checkfunction)? $(;$generics)*);
+    };
     ($name:ty, $typeobject:expr, $type_hint_module:expr, $type_hint_name:expr, #module=$module:expr $(, #checkfunction=$checkfunction:path)? $(;$generics:ident)*) => {
         $crate::pyobject_native_type_named!($name $(;$generics)*);
-        $crate::pyobject_native_type_info!($name, $typeobject, $type_hint_module, $type_hint_name, $module $(, #checkfunction=$checkfunction)? $(;$generics)*);
+        $crate::pyobject_native_type_info!($name, $typeobject, $type_hint_module, $type_hint_name, $module, #static_type_object=false $(, #checkfunction=$checkfunction)? $(;$generics)*);
     };
     ($name:ty, $typeobject:expr, $type_hint_module:expr, $type_hint_name:expr, #module=$module:expr $(, #checkfunction=$checkfunction:path)? $(;$generics:ident)*) => {
         $crate::pyobject_native_type_core!($name, $typeobject, $type_hint_module, $type_hint_name, #module=$module $(, #checkfunction=$checkfunction)? $(;$generics)*);
+    };
+    ($name:ty, pyobject_native_static_type_object!($typeobject:expr), $type_hint_module:expr, $type_hint_name:expr $(, #checkfunction=$checkfunction:path)? $(;$generics:ident)*) => {
+        $crate::pyobject_native_type_core!($name, pyobject_native_static_type_object!($typeobject), $type_hint_module, $type_hint_name, #module=::std::option::Option::Some("builtins") $(, #checkfunction=$checkfunction)? $(;$generics)*);
     };
     ($name:ty, $typeobject:expr, $type_hint_module:expr, $type_hint_name:expr $(, #checkfunction=$checkfunction:path)? $(;$generics:ident)*) => {
         $crate::pyobject_native_type_core!($name, $typeobject, $type_hint_module, $type_hint_name, #module=::std::option::Option::Some("builtins") $(, #checkfunction=$checkfunction)? $(;$generics)*);
@@ -251,6 +271,14 @@ macro_rules! pyobject_native_type_sized {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! pyobject_native_type {
+    // Static type-object marker form: must precede the general arm (see the
+    // ordering note on `pyobject_native_type_core`).
+    ($name:ty, $layout:path, pyobject_native_static_type_object!($typeobject:expr), $type_hint_module:expr, $type_hint_name:expr $(, #module=$module:expr)? $(, #checkfunction=$checkfunction:path)? $(;$generics:ident)*) => {
+        $crate::pyobject_native_type_core!($name, pyobject_native_static_type_object!($typeobject), $type_hint_module, $type_hint_name $(, #module=$module)? $(, #checkfunction=$checkfunction)? $(;$generics)*);
+        // To prevent inheriting native types with ABI3
+        #[cfg(not(Py_LIMITED_API))]
+        $crate::pyobject_native_type_sized!($name, $layout $(;$generics)*);
+    };
     ($name:ty, $layout:path, $typeobject:expr, $type_hint_module:expr, $type_hint_name:expr $(, #module=$module:expr)? $(, #checkfunction=$checkfunction:path)? $(;$generics:ident)*) => {
         $crate::pyobject_native_type_core!($name, $typeobject, $type_hint_module, $type_hint_name $(, #module=$module)? $(, #checkfunction=$checkfunction)? $(;$generics)*);
         // To prevent inheriting native types with ABI3
@@ -269,6 +297,7 @@ pub(crate) mod complex;
 pub(crate) mod datetime;
 pub(crate) mod dict;
 mod ellipsis;
+pub(crate) mod fast_extract;
 pub(crate) mod float;
 #[cfg(all(not(Py_LIMITED_API), not(PyPy), not(GraalPy)))]
 mod frame;

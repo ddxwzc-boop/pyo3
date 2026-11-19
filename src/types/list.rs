@@ -1,11 +1,15 @@
+use crate::conversion::FromPyObjectOwned;
 use crate::err::{self, PyResult};
 use crate::ffi::{self, Py_ssize_t};
 use crate::ffi_ptr_ext::FfiPtrExt;
 use crate::internal_tricks::get_ssize_index;
+use crate::types::any::PyAnyMethods;
+use crate::types::fast_extract::{fast_or_pin, FastExtract, FastOrPinned};
 use crate::types::sequence::PySequenceMethods;
 use crate::types::{PySequence, PyTuple};
 use crate::{Borrowed, Bound, BoundObject, IntoPyObject, IntoPyObjectExt, PyAny, PyErr, Python};
 use std::iter::FusedIterator;
+use std::marker::PhantomData;
 #[cfg(feature = "nightly")]
 use std::num::NonZero;
 
@@ -222,6 +226,44 @@ pub trait PyListMethods<'py>: crate::sealed::Sealed {
     /// Returns an iterator over this list's items.
     fn iter(&self) -> BoundListIterator<'py>;
 
+    /// Iterates over this list, converting each item to `T` on the fly.
+    ///
+    /// This is a safe alternative to taking a reference count per item (which
+    /// is what [`iter`][PyListMethods::iter] does by yielding owned items):
+    /// items which are *exact* native objects (`int`, `float`) are read
+    /// directly inside the iterator step without any reference-count change,
+    /// while anything else (subclasses, custom `__index__` / `__float__`
+    /// implementors) is pinned — its reference count incremented — before the
+    /// conversion runs, so Python code which reenters during the conversion
+    /// cannot free it.
+    ///
+    /// The conversion of each item is exactly `item.extract()`, so error
+    /// behavior matches composing [`iter`][PyListMethods::iter] with `extract`:
+    /// each step yields a `PyResult`. Iteration order, the
+    /// `min(initial_length, current_length)` bound while mutating the list,
+    /// and the mutation-during-iteration semantics all match
+    /// [`iter`][PyListMethods::iter].
+    ///
+    /// `T` must be one of the native numeric types (see
+    /// [`FastExtract`](crate::types::iter::FastExtract)); other types can be
+    /// handled with `iter().map(Bound::extract)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use pyo3::prelude::*;
+    /// # Python::attach(|py| {
+    /// let list = pyo3::types::PyList::new(py, [1, 2, 3]).unwrap();
+    /// let sum: i64 = list.iter_extract::<i64>()
+    ///     .map(|item| item.unwrap())
+    ///     .sum();
+    /// assert_eq!(sum, 6);
+    /// # });
+    /// ```
+    fn iter_extract<T>(&self) -> ExtractingListIterator<'py, T>
+    where
+        T: FastExtract + FromPyObjectOwned<'py>;
+
     /// Iterates over the contents of this list while holding a critical section on the list.
     /// This is useful when the GIL is disabled and the list is shared between threads.
     /// It is not guaranteed that the list will not be modified during iteration when the
@@ -435,6 +477,13 @@ impl<'py> PyListMethods<'py> for Bound<'py, PyList> {
     /// Returns an iterator over this list's items.
     fn iter(&self) -> BoundListIterator<'py> {
         BoundListIterator::new(self.clone())
+    }
+
+    fn iter_extract<T>(&self) -> ExtractingListIterator<'py, T>
+    where
+        T: FastExtract + FromPyObjectOwned<'py>,
+    {
+        ExtractingListIterator::new(self.clone())
     }
 
     /// Iterates over a list while holding a critical section, calling a closure on each item
@@ -937,6 +986,236 @@ impl ExactSizeIterator for BoundListIterator<'_> {
 }
 
 impl FusedIterator for BoundListIterator<'_> {}
+
+/// Used by `PyListMethods::iter_extract`.
+///
+/// Yields `PyResult<T>` values converted from the list's items without taking
+/// a reference count per item: items which are *exact* native objects (`int`,
+/// `float`) are read directly inside the iterator step (see
+/// [`FastExtract`](crate::types::iter::FastExtract)), and every other item is
+/// pinned — its reference count incremented — *before* the ordinary
+/// extraction machinery can call back into Python. Because of that pinning
+/// this is a safe API: reentrant Python code (e.g. a `__index__` triggered by
+/// the conversion of a custom object) cannot free an item while it is being
+/// converted, no matter how the list is mutated in the meantime.
+///
+/// The iteration guards match the owned [`BoundListIterator`]: the bound is
+/// `min(initial_length, current_length)`, so a list which shrinks ends the
+/// iteration early and a list which grows does not extend it.
+///
+/// Like the owned iterator's, this iterator does not implement
+/// `FusedIterator`: a mutable list can shrink below the iterator's position
+/// (making `next()` return `None`) and then grow back.
+pub struct ExtractingListIterator<'py, T> {
+    list: Bound<'py, PyList>,
+    index: usize,
+    length: usize,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<'py, T: FastExtract + FromPyObjectOwned<'py>> ExtractingListIterator<'py, T> {
+    fn new(list: Bound<'py, PyList>) -> Self {
+        let length = list.len();
+        ExtractingListIterator {
+            list,
+            index: 0,
+            length,
+            _marker: PhantomData,
+        }
+    }
+
+    #[inline]
+    fn with_critical_section<R>(
+        &mut self,
+        f: impl FnOnce(&mut usize, &mut usize, &Bound<'py, PyList>) -> R,
+    ) -> R {
+        let Self {
+            list,
+            index,
+            length,
+            ..
+        } = self;
+        crate::sync::critical_section::with_critical_section(list, || f(index, length, list))
+    }
+
+    /// Converts the item at `index` from `list` into `T`.
+    ///
+    /// # Safety
+    ///
+    /// - `index` must be less than the current length of the list, so that
+    ///   the read stays in bounds of the item array.
+    /// - The list must not contain null pointers (the same contract as
+    ///   [`PyListMethods::get_item_unchecked`]).
+    #[inline]
+    #[cfg(not(Py_LIMITED_API))]
+    #[deny(unsafe_op_in_unsafe_fn)]
+    unsafe fn extract_item(list: &Bound<'py, PyList>, index: usize) -> PyResult<T> {
+        let py = list.py();
+        // SAFETY: `index < length <= list.len()`; non-null contract above.
+        let item = unsafe { ffi::PyList_GET_ITEM(list.as_ptr(), index as Py_ssize_t) };
+        // Phase 1: the reentrance-free window. `fast_or_pin` reads the value
+        // via pure field reads when the item is an exact native object, or
+        // pins it (Py_INCREF) otherwise — neither branch can call into the
+        // interpreter or allocate, so the unpinned pointer cannot be freed
+        // while held (on the GIL build no other mutator can run; on the
+        // free-threaded build the caller-side critical section is held).
+        // SAFETY: `item` is a live object (from the slot); see phase 1.
+        let slot = unsafe { fast_or_pin::<T>(py, item) };
+        // Phase 2: ordinary conversion. Reentrant Python code may free the
+        // *slot's* copy, but pinned items are kept alive by the reference
+        // taken in phase 1, and fast-read items are already converted.
+        match slot {
+            FastOrPinned::Fast(value) => Ok(value),
+            FastOrPinned::Pinned(pinned) => pinned.extract().map_err(Into::into),
+        }
+    }
+
+    /// Converts the item at `index` from `list` into `T`, on the limited API,
+    /// where `PyList_GET_ITEM` is not available.
+    ///
+    /// # Panics
+    ///
+    /// PANIC-SAFETY: the caller-side guard invariant `index < min(initial_length,
+    /// current_length) <= current_length` makes the only documented failure mode of
+    /// `PyList_GetItem` (index out of bounds) impossible, so a `NULL` return means the
+    /// invariant is broken and panicking is the intended failure mode (mirroring the
+    /// owned iterator's fallback).
+    #[inline]
+    #[cfg(Py_LIMITED_API)]
+    fn extract_item_limited(list: &Bound<'py, PyList>, index: usize) -> PyResult<T> {
+        // On the limited API the fast path is unavailable; `get_item` returns
+        // an owned (pinned) item, which is safe to convert however the list
+        // is mutated afterwards.
+        let pinned = list.get_item(index).expect("list.get failed");
+        pinned.extract().map_err(Into::into)
+    }
+}
+
+impl<'py, T: FastExtract + FromPyObjectOwned<'py>> Iterator for ExtractingListIterator<'py, T> {
+    type Item = PyResult<T>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        #[cfg(not(Py_LIMITED_API))]
+        {
+            self.with_critical_section(|index, length, list| {
+                let length = (*length).min(list.len());
+                let my_index = *index;
+                if my_index < length {
+                    *index += 1;
+                    // SAFETY: my_index < length <= list.len(); non-null contract
+                    // above.
+                    Some(unsafe { Self::extract_item(list, my_index) })
+                } else {
+                    None
+                }
+            })
+        }
+        #[cfg(Py_LIMITED_API)]
+        {
+            self.with_critical_section(|index, length, list| {
+                let length = (*length).min(list.len());
+                let my_index = *index;
+                if my_index < length {
+                    *index += 1;
+                    Some(Self::extract_item_limited(list, my_index))
+                } else {
+                    None
+                }
+            })
+        }
+    }
+
+    #[inline]
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.with_critical_section(|index, length, list| {
+            let length = (*length).min(list.len());
+            let target_index = (*index).checked_add(n)?;
+            if target_index < length {
+                *index = target_index + 1;
+                #[cfg(not(Py_LIMITED_API))]
+                {
+                    // SAFETY: target_index < length <= list.len(); non-null
+                    // contract.
+                    Some(unsafe { Self::extract_item(list, target_index) })
+                }
+                #[cfg(Py_LIMITED_API)]
+                {
+                    Some(Self::extract_item_limited(list, target_index))
+                }
+            } else {
+                None
+            }
+        })
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl<'py, T: FastExtract + FromPyObjectOwned<'py>> DoubleEndedIterator
+    for ExtractingListIterator<'py, T>
+{
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.with_critical_section(|index, length, list| {
+            let current_length = (*length).min(list.len());
+            if *index < current_length {
+                *length = current_length - 1;
+                #[cfg(not(Py_LIMITED_API))]
+                {
+                    // SAFETY: current_length - 1 < list.len(); non-null contract.
+                    Some(unsafe { Self::extract_item(list, current_length - 1) })
+                }
+                #[cfg(Py_LIMITED_API)]
+                {
+                    Some(Self::extract_item_limited(list, current_length - 1))
+                }
+            } else {
+                None
+            }
+        })
+    }
+
+    #[inline]
+    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+        self.with_critical_section(|index, length, list| {
+            let length_size = (*length).min(list.len());
+            let target_from_end = n.checked_add(*index)?;
+            if target_from_end < length_size {
+                let target_index = length_size - n - 1;
+                *length = target_index;
+                #[cfg(not(Py_LIMITED_API))]
+                {
+                    // SAFETY: target_index < length_size <= list.len();
+                    // non-null contract.
+                    Some(unsafe { Self::extract_item(list, target_index) })
+                }
+                #[cfg(Py_LIMITED_API)]
+                {
+                    Some(Self::extract_item_limited(list, target_index))
+                }
+            } else {
+                None
+            }
+        })
+    }
+}
+
+impl<'py, T: FastExtract + FromPyObjectOwned<'py>> ExactSizeIterator
+    for ExtractingListIterator<'py, T>
+{
+    /// Upper bound on the remaining items, computed from the length captured at
+    /// iterator creation: if the list shrinks during iteration, `len()` can be
+    /// greater than the number of items `next()` will still yield (the same
+    /// approximation as the owned `BoundListIterator`).
+    fn len(&self) -> usize {
+        self.length.saturating_sub(self.index)
+    }
+}
 
 impl<'py> IntoIterator for Bound<'py, PyList> {
     type Item = Bound<'py, PyAny>;
@@ -1797,5 +2076,228 @@ mod tests {
             let list = PyList::new(py, vec![1, 2, 3]).unwrap();
             assert_eq!(list.iter().count(), 3);
         })
+    }
+
+    /// UT for `PyListMethods::iter_extract` — same values as the owned iterator.
+    /// # Brief: build a 100_000-element int list, collect `iter_extract::<i64>`
+    /// and `iter()`+`extract` results, compare counts and order.
+    #[test]
+    fn iter_extract_yields_same_values_as_owned() {
+        Python::attach(|py| {
+            const LEN: usize = 100_000;
+            let list = PyList::new(py, 0..LEN).unwrap();
+            let extracted: Vec<i64> = list.iter_extract::<i64>().map(|r| r.unwrap()).collect();
+            let owned: Vec<i64> = list.iter().map(|x| x.extract::<i64>().unwrap()).collect();
+            assert_eq!(extracted.len(), LEN);
+            assert_eq!(extracted, owned);
+        });
+    }
+
+    /// UT for `iter_extract` fast path on floats.
+    #[test]
+    fn iter_extract_floats_match_owned() {
+        Python::attach(|py| {
+            let list = PyList::new(py, [0.5f64, 1.25, 2.5, 3.75]).unwrap();
+            let extracted: Vec<f64> = list.iter_extract::<f64>().map(|r| r.unwrap()).collect();
+            let owned: Vec<f64> = list.iter().map(|x| x.extract::<f64>().unwrap()).collect();
+            assert_eq!(extracted, owned);
+        });
+    }
+
+    /// UT for `iter_extract` empty list.
+    #[test]
+    fn iter_extract_empty_list() {
+        Python::attach(|py| {
+            let list = PyList::empty(py);
+            let mut it = list.iter_extract::<i64>();
+            assert!(it.next().is_none());
+            assert_eq!(it.len(), 0);
+        });
+    }
+
+    /// UT for `ExtractingListIterator` clamp guard when the list shrinks.
+    /// # Brief: same shape as the owned iterator clamp test: consume 2 items,
+    /// `del_item(0)` twice (len=2); the next `next()` returns None because the
+    /// clamped length is `min(4, 2) = 2` and index=2.
+    #[test]
+    fn iter_extract_clamps_when_list_shrinks() {
+        Python::attach(|py| {
+            let list = PyList::new(py, [0, 1, 2, 3]).unwrap();
+            let mut it = list.iter_extract::<i64>();
+            assert_eq!(it.next().unwrap().unwrap(), 0);
+            assert_eq!(it.next().unwrap().unwrap(), 1);
+            list.del_item(0).unwrap();
+            list.del_item(0).unwrap();
+            assert_eq!(list.len(), 2);
+            assert!(it.next().is_none());
+            assert_eq!(it.len(), 2);
+        });
+    }
+
+    /// UT for `ExtractingListIterator` initial-length bound when the list grows.
+    #[test]
+    fn iter_extract_bounded_by_initial_length() {
+        Python::attach(|py| {
+            let list = PyList::new(py, [10, 11]).unwrap();
+            let mut it = list.iter_extract::<i64>();
+            list.append(12).unwrap();
+            list.append(13).unwrap();
+            assert_eq!(it.next().unwrap().unwrap(), 10);
+            assert_eq!(it.next().unwrap().unwrap(), 11);
+            assert!(it.next().is_none());
+        });
+    }
+
+    /// UT for `ExtractingListIterator::nth` O(1) specialization.
+    #[test]
+    fn iter_extract_nth_matches_repeated_next() {
+        Python::attach(|py| {
+            const LEN: usize = 50;
+            let list = PyList::new(py, 0..LEN).unwrap();
+            let mut it = list.iter_extract::<i64>();
+            assert_eq!(it.nth(10).unwrap().unwrap(), 10);
+            assert_eq!(it.nth(5).unwrap().unwrap(), 16);
+            assert_eq!(list.iter().nth(10).unwrap().extract::<i64>().unwrap(), 10);
+        });
+    }
+
+    /// UT for `ExtractingListIterator::nth_back` O(1) specialization.
+    #[test]
+    fn iter_extract_nth_back_matches_reverse() {
+        Python::attach(|py| {
+            const LEN: usize = 50;
+            let list = PyList::new(py, 0..LEN).unwrap();
+            let mut it = list.iter_extract::<i64>();
+            assert_eq!(it.nth_back(10).unwrap().unwrap(), 39);
+            assert_eq!(
+                list.iter().nth_back(10).unwrap().extract::<i64>().unwrap(),
+                39
+            );
+        });
+    }
+
+    /// UT for `ExtractingListIterator` double-ended alternating consumption.
+    #[test]
+    fn iter_extract_next_back_paired() {
+        Python::attach(|py| {
+            let list = PyList::new(py, [0, 1, 2, 3]).unwrap();
+            let mut it = list.iter_extract::<i64>();
+            assert_eq!(it.next().unwrap().unwrap(), 0);
+            assert_eq!(it.next_back().unwrap().unwrap(), 3);
+            assert_eq!(it.next().unwrap().unwrap(), 1);
+            assert_eq!(it.next_back().unwrap().unwrap(), 2);
+            assert!(it.next().is_none());
+            assert!(it.next_back().is_none());
+        });
+    }
+
+    /// UT for `ExtractingListIterator` ExactSizeIterator tracking.
+    #[test]
+    fn iter_extract_exact_size() {
+        Python::attach(|py| {
+            let list = PyList::new(py, [0, 1, 2, 3]).unwrap();
+            let mut it = list.iter_extract::<i64>();
+            assert_eq!(it.len(), 4);
+            it.next().unwrap().unwrap();
+            it.next().unwrap().unwrap();
+            assert_eq!(it.len(), 2);
+        });
+    }
+
+    /// UT for `iter_extract` error parity with `iter()`+`extract`.
+    /// # Brief: `[1, "str", 3]` yields Ok(1) then an Err whose Python type
+    /// matches the owned iterator's extraction error; a subsequent new
+    /// iterator still reads item 3 correctly (the error did not corrupt the
+    /// list).
+    #[test]
+    fn iter_extract_error_parity() {
+        Python::attach(|py| {
+            let list = PyList::new(py, [1i64, 3i64]).unwrap();
+            list.insert(1, "str").unwrap();
+            let mut it = list.iter_extract::<i64>();
+            assert_eq!(it.next().unwrap().unwrap(), 1);
+            let err = it.next().unwrap().unwrap_err();
+            let owned_err = list.iter().nth(1).unwrap().extract::<i64>().unwrap_err();
+            assert!(err.get_type(py).is(owned_err.get_type(py)));
+            // error did not disturb the list
+            assert_eq!(list.get_item(2).unwrap().extract::<i64>().unwrap(), 3);
+        });
+    }
+
+    /// UT for `iter_extract` reentrancy hardening — `__index__` replacing the
+    /// item's own slot during conversion.
+    /// # Brief: `[1, Evil(), 3]` where `Evil.__index__` replaces slot 1 with
+    /// 99 and returns 7. The pinning slow path must keep the `Evil` instance
+    /// alive across its own `__index__` execution, and the yielded values
+    /// must match the owned iterator + `extract` arm exactly (`[1, 7, 3]`).
+    /// This is the exact scenario which produced a dangling borrow with the
+    /// unsafe `iter_borrowed` design.
+    #[test]
+    fn iter_extract_reentrant_replacement_matches_owned() {
+        Python::attach(|py| {
+            let class_def = cr#"
+class Evil:
+    def __index__(self):
+        target[1] = 99
+        return 7
+"#;
+
+            let locals = crate::types::PyDict::new(py);
+            py.run(class_def, Some(&locals), None).unwrap();
+            let list = py
+                .eval(c"[1, Evil(), 3]", Some(&locals), None)
+                .unwrap()
+                .cast_into::<PyList>()
+                .unwrap();
+            locals.set_item("target", &list).unwrap();
+            let extracted: Vec<i64> = list.iter_extract::<i64>().map(|r| r.unwrap()).collect();
+            assert_eq!(extracted, vec![1, 7, 3]);
+
+            let locals = crate::types::PyDict::new(py);
+            py.run(class_def, Some(&locals), None).unwrap();
+            let list = py
+                .eval(c"[1, Evil(), 3]", Some(&locals), None)
+                .unwrap()
+                .cast_into::<PyList>()
+                .unwrap();
+            locals.set_item("target", &list).unwrap();
+            let owned: Vec<i64> = list.iter().map(|x| x.extract::<i64>().unwrap()).collect();
+            assert_eq!(owned, vec![1, 7, 3]);
+        });
+    }
+
+    /// UT for `iter_extract` reentrancy hardening — `__index__` clearing the
+    /// list during conversion.
+    /// # Brief: `[1, Evil(), 3]` where `Evil.__index__` clears the list.
+    /// Both `iter_extract` and the owned arm must stop at the same point
+    /// (the length clamp), yielding `[1, 7]`.
+    #[test]
+    fn iter_extract_reentrant_clear_matches_owned() {
+        Python::attach(|py| {
+            let class_def = cr#"
+class Evil:
+    def __index__(self):
+        target.clear()
+        return 7
+"#;
+
+            let run = |arm: &str| -> Vec<i64> {
+                let locals = crate::types::PyDict::new(py);
+                py.run(class_def, Some(&locals), None).unwrap();
+                let list = py
+                    .eval(c"[1, Evil(), 3]", Some(&locals), None)
+                    .unwrap()
+                    .cast_into::<PyList>()
+                    .unwrap();
+                locals.set_item("target", &list).unwrap();
+                match arm {
+                    "extract" => list.iter_extract::<i64>().map(|r| r.unwrap()).collect(),
+                    _ => list.iter().map(|x| x.extract::<i64>().unwrap()).collect(),
+                }
+            };
+
+            assert_eq!(run("extract"), vec![1, 7]);
+            assert_eq!(run("owned"), vec![1, 7]);
+        });
     }
 }
