@@ -210,7 +210,7 @@ pub unsafe fn PyIndex_Check(o: *mut PyObject) -> c_int {
 
 extern "C" {
     #[cfg(any(all(Py_3_8, Py_LIMITED_API), PyPy))]
-    #[link_name = "PyPyIndex_Check"]
+    #[cfg_attr(PyPy, link_name = "PyPyIndex_Check")]
     pub fn PyIndex_Check(o: *mut PyObject) -> c_int;
 
     #[cfg_attr(PyPy, link_name = "PyPyNumber_Index")]

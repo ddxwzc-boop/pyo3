@@ -6,6 +6,13 @@ use codspeed_criterion_compat::{criterion_group, criterion_main, Bencher, Criter
 use pyo3::types::IntoPyDict;
 use pyo3::{prelude::*, types::PyMapping};
 
+/// B-arm body of the D2 A/B pair: uses the safe extracting iterator
+/// (`iter_extract`, zero refcount per pair on exact native members; pinned
+/// slow path otherwise). The loop semantics match the A tree (pristine
+/// 0.28.2) upstream body — iterate all pairs, sum the keys — with the
+/// caveat that the extracting iterator also converts each value (the price
+/// of yielding values instead of references); the two-tree paired diff is
+/// the optimization effect.
 fn iter_dict(b: &mut Bencher<'_>) {
     Python::attach(|py| {
         const LEN: usize = 100_000;
@@ -15,9 +22,8 @@ fn iter_dict(b: &mut Bencher<'_>) {
             .unwrap();
         let mut sum = 0;
         b.iter(|| {
-            for (k, _v) in &dict {
-                let i: u64 = k.extract().unwrap();
-                sum += i;
+            for (k, _v) in dict.iter_extract::<u64, u64>().map(|r| r.unwrap()) {
+                sum += k;
             }
         });
     })

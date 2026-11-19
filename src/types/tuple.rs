@@ -664,12 +664,23 @@ macro_rules! tuple_conversion ({$length:expr,$(($refN:ident, $n:tt, $T:ident)),+
         fn call(
             self,
             function: Borrowed<'_, 'py, PyAny>,
-            kwargs: Borrowed<'_, '_, crate::types::PyDict>,
+            kwargs: Borrowed<'_, 'py, crate::types::PyDict>,
             _: crate::call::private::Token,
         ) -> PyResult<Bound<'py, PyAny>> {
             let py = function.py();
             // We need this to drop the arguments correctly.
             let args_bound = [$(self.$n.into_bound_py_any(py)?,)*];
+            #[cfg(not(Py_3_13))]
+            {
+                // Fast path with interned kwnames; falls back to
+                // `PyObject_VectorcallDict` when the callable has no
+                // vectorcall support.
+                if let Some(result) =
+                    crate::call::call_with_interned_kwargs(function, &args_bound, kwargs)
+                {
+                    return result;
+                }
+            }
             // Prepend one null argument for `PY_VECTORCALL_ARGUMENTS_OFFSET`.
             let mut args = [std::ptr::null_mut(), $(args_bound[$n].as_ptr()),*];
             unsafe {
@@ -793,12 +804,23 @@ macro_rules! tuple_conversion ({$length:expr,$(($refN:ident, $n:tt, $T:ident)),+
         fn call(
             self,
             function: Borrowed<'_, 'py, PyAny>,
-            kwargs: Borrowed<'_, '_, crate::types::PyDict>,
+            kwargs: Borrowed<'_, 'py, crate::types::PyDict>,
             _: crate::call::private::Token,
         ) -> PyResult<Bound<'py, PyAny>> {
             let py = function.py();
             // We need this to drop the arguments correctly.
             let args_bound = [$(self.$n.into_bound_py_any(py)?,)*];
+            #[cfg(not(Py_3_13))]
+            {
+                // Fast path with interned kwnames; falls back to
+                // `PyObject_VectorcallDict` when the callable has no
+                // vectorcall support.
+                if let Some(result) =
+                    crate::call::call_with_interned_kwargs(function, &args_bound, kwargs)
+                {
+                    return result;
+                }
+            }
             // Prepend one null argument for `PY_VECTORCALL_ARGUMENTS_OFFSET`.
             let mut args = [std::ptr::null_mut(), $(args_bound[$n].as_ptr()),*];
             unsafe {
