@@ -81,9 +81,10 @@ pub use self::weakref::{PyWeakref, PyWeakrefMethods, PyWeakrefProxy, PyWeakrefRe
 /// the Limited API and PyPy, the underlying structures are opaque and that may not be possible.
 /// In these cases the iterators are implemented by forwarding to [`PyIterator`].
 pub mod iter {
-    pub use super::dict::BoundDictIterator;
+    pub use super::dict::{BoundDictIterator, ExtractingDictIterator};
+    pub use super::fast_extract::FastExtract;
     pub use super::frozenset::BoundFrozenSetIterator;
-    pub use super::list::BoundListIterator;
+    pub use super::list::{BoundListIterator, ExtractingListIterator};
     pub use super::set::BoundSetIterator;
     pub use super::tuple::{BorrowedTupleIterator, BoundTupleIterator};
 }
@@ -269,6 +270,7 @@ pub(crate) mod complex;
 pub(crate) mod datetime;
 pub(crate) mod dict;
 mod ellipsis;
+pub(crate) mod fast_extract;
 pub(crate) mod float;
 #[cfg(all(not(Py_LIMITED_API), not(PyPy), not(GraalPy)))]
 mod frame;

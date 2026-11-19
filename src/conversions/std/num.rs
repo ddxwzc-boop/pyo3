@@ -89,11 +89,32 @@ macro_rules! extract_int {
         // simplest logic for 3.10+ where that was fixed - python/cpython#82180.
         // `PyLong_AsUnsignedLongLong` does not call `PyNumber_Index`, hence the `force_index_call` argument
         // See https://github.com/PyO3/pyo3/pull/3742 for details
+        //
+        // On 3.10+ the success path is byte-identical to upstream: the
+        // conversion API is called directly and only its error sentinel
+        // (with an exception actually set) branches out to the cold
+        // classifier, which either returns the lazy error (for inputs which
+        // can never be index-converted) or fetches the real error.
+        //
+        // The `c_long` family does not go through this macro on 3.10+: it
+        // extracts through `extract_int_as_c_long`, which calls
+        // `PyLong_AsLongAndOverflow` directly (`PyLong_AsLong` is exactly
+        // that call plus an overflow branch on every supported CPython
+        // version, so the wrapper frame is pure overhead).
         if cfg!(Py_3_10) && !$force_index_call {
-            err_if_invalid_value($obj.py(), $error_val, unsafe { $pylong_as($obj.as_ptr()) })
+            let value = unsafe { $pylong_as($obj.as_ptr()) };
+            if value == $error_val && unsafe { !ffi::PyErr_Occurred().is_null() } {
+                Err(extract_int_conversion_error($obj))
+            } else {
+                Ok(value)
+            }
         } else if let Ok(long) = $obj.cast::<crate::types::PyInt>() {
             // fast path - checking for subclass of `int` just checks a bit in the type $object
             err_if_invalid_value($obj.py(), $error_val, unsafe { $pylong_as(long.as_ptr()) })
+        } else if unsafe { is_not_indexable($obj.as_ptr()) } {
+            // Lazy failure for the `nb_index` fallback: the type has no
+            // `__index__` slot, so `PyNumber_Index` is guaranteed to raise.
+            Err(extract_int_type_error($obj))
         } else {
             unsafe {
                 let num = nb_index(&$obj)?;
@@ -207,7 +228,7 @@ macro_rules! int_fits_c_long {
             const INPUT_TYPE: PyStaticExpr = PyInt::TYPE_HINT;
 
             fn extract(obj: Borrowed<'_, 'py, PyAny>) -> Result<Self, Self::Error> {
-                let val: c_long = extract_int!(obj, -1, ffi::PyLong_AsLong)?;
+                let val: c_long = extract_int_as_c_long(obj)?;
                 <$rust_type>::try_from(val)
                     .map_err(|e| exceptions::PyOverflowError::new_err(e.to_string()))
             }
@@ -298,7 +319,7 @@ impl<'py> FromPyObject<'_, 'py> for u8 {
     const INPUT_TYPE: PyStaticExpr = PyInt::TYPE_HINT;
 
     fn extract(obj: Borrowed<'_, 'py, PyAny>) -> Result<Self, Self::Error> {
-        let val: c_long = extract_int!(obj, -1, ffi::PyLong_AsLong)?;
+        let val: c_long = extract_int_as_c_long(obj)?;
         u8::try_from(val).map_err(|e| exceptions::PyOverflowError::new_err(e.to_string()))
     }
 
@@ -667,6 +688,157 @@ fn err_if_invalid_value<T: PartialEq>(
     Ok(actual_value)
 }
 
+/// Whether an object's type is neither an `int` (or subclass) nor defines
+/// `__index__`, and thus can never be converted to an integer.
+///
+/// Reads the type slots directly (rather than via the `pyo3-ffi` helper
+/// functions) so that the check fully inlines into the extraction fast path.
+#[cfg(not(any(Py_LIMITED_API, GraalPy, PyPy, Py_GIL_DISABLED)))]
+#[inline(always)]
+unsafe fn is_not_indexable(obj: *mut ffi::PyObject) -> bool {
+    unsafe {
+        let ty = (*obj).ob_type;
+        ((*ty).tp_flags & ffi::Py_TPFLAGS_LONG_SUBCLASS) == 0
+            && ((*ty).tp_as_number.is_null() || (*(*ty).tp_as_number).nb_index.is_none())
+    }
+}
+
+// PyPy is included in the fallback (rather than the direct slot reads above):
+// its `nb_index` slot is not guaranteed to be materialized, so the FFI check
+// is the only reliable predicate. The free-threaded build also falls back to
+// the FFI check because `tp_flags` is atomic there.
+#[cfg(any(Py_LIMITED_API, GraalPy, PyPy, Py_GIL_DISABLED))]
+#[inline(always)]
+unsafe fn is_not_indexable(obj: *mut ffi::PyObject) -> bool {
+    // `PyIndex_Check` is declared for the limited API (3.8+) and PyPy; for
+    // abi3-py37 (limited API below 3.8) it is not available, so conservatively
+    // assume the object might be indexable and run the original conversion
+    // path unchanged.
+    #[cfg(not(all(Py_LIMITED_API, not(Py_3_8))))]
+    {
+        unsafe { ffi::PyLong_Check(obj) == 0 && ffi::PyIndex_Check(obj) == 0 }
+    }
+    #[cfg(all(Py_LIMITED_API, not(Py_3_8)))]
+    {
+        let _ = obj;
+        false
+    }
+}
+
+/// Extraction of the `c_long` family (i8/i16/u16/i32 plus i64/isize/u32/u8
+/// where `c_long` is 64 bits). On Python 3.10+ this calls
+/// `PyLong_AsLongAndOverflow` directly: `PyLong_AsLong` is exactly that call
+/// plus an overflow branch on every supported CPython version, so the
+/// wrapper frame is pure overhead. On overflow the C function returns -1
+/// with the flag set and *without* raising any exception, so the
+/// `OverflowError` is constructed locally with CPython's own message
+/// (byte-identical) instead of being fetched from the interpreter. Below
+/// 3.10 the original fallback chain (`int` subclass fast path, lazy
+/// non-indexable failure, `__index__` conversion) is kept unchanged.
+#[inline]
+fn extract_int_as_c_long(obj: Borrowed<'_, '_, PyAny>) -> Result<c_long, PyErr> {
+    if cfg!(Py_3_10) {
+        let mut overflow: std::ffi::c_int = 0;
+        let value = unsafe { ffi::PyLong_AsLongAndOverflow(obj.as_ptr(), &mut overflow) };
+        if overflow != 0 {
+            // CPython documents (and 3.10-3.14 all honor) that overflow sets
+            // the flag without raising; `PyLong_AsLong` then overwrites the
+            // error indicator with the `OverflowError`. Mirror that replace
+            // semantics for any interpreter that would also set an error.
+            if !unsafe { ffi::PyErr_Occurred() }.is_null() {
+                unsafe { ffi::PyErr_Clear() };
+            }
+            Err(extract_int_overflow_error())
+        } else if value == -1 && unsafe { !ffi::PyErr_Occurred().is_null() } {
+            Err(extract_int_conversion_error(obj))
+        } else {
+            Ok(value)
+        }
+    } else if let Ok(long) = obj.cast::<PyInt>() {
+        // fast path - checking for subclass of `int` just checks a bit in the type object
+        err_if_invalid_value(obj.py(), -1, unsafe { ffi::PyLong_AsLong(long.as_ptr()) })
+    } else if unsafe { is_not_indexable(obj.as_ptr()) } {
+        // Lazy failure for the `nb_index` fallback: the type has no
+        // `__index__` slot, so `PyNumber_Index` is guaranteed to raise.
+        Err(extract_int_type_error(obj))
+    } else {
+        let num = nb_index(&obj)?;
+        err_if_invalid_value(obj.py(), -1, unsafe { ffi::PyLong_AsLong(num.as_ptr()) })
+    }
+}
+
+/// `OverflowError` for the direct `PyLong_AsLongAndOverflow` path on the
+/// `c_long` family. `PyLong_AsLong` raises this message verbatim on every
+/// supported CPython version (both overflow directions), so constructing it
+/// here keeps behavior byte-identical while skipping the wrapper call. Like
+/// the other cold constructors below, it goes through the lazy `PyErr` state
+/// without touching the interpreter.
+#[cold]
+#[inline(never)]
+fn extract_int_overflow_error() -> PyErr {
+    exceptions::PyOverflowError::new_err("Python int too large to convert to C long")
+}
+
+/// Cold failure classifier for `extract_int!` on Python 3.10+: the conversion
+/// API returned its error sentinel with an exception set. If the input can
+/// never be index-converted (neither an `int` subclass nor `__index__`), the
+/// interpreter's `TypeError` is exactly the predictable one — clear it and
+/// return the lazy error instead of fetching and converting it. Otherwise
+/// this is a real conversion error (an exception raised by `__index__`
+/// itself, or an overflow) and is fetched and propagated unchanged.
+#[cold]
+#[inline(never)]
+fn extract_int_conversion_error(obj: Borrowed<'_, '_, PyAny>) -> PyErr {
+    if unsafe { is_not_indexable(obj.as_ptr()) } {
+        // SAFETY: an exception is set (verified by the caller) and the GIL is
+        // held; clearing it drops the never-observed `TypeError` the
+        // conversion just raised.
+        unsafe { ffi::PyErr_Clear() };
+        extract_int_type_error(obj)
+    } else {
+        // The caller verified an exception is set, so `take` cannot return
+        // `None` in practice; keep a well-defined fallback rather than
+        // panicking.
+        PyErr::take(obj.py()).unwrap_or_else(|| extract_int_type_error(obj))
+    }
+}
+
+/// Constructs the `TypeError` returned when integer extraction is attempted
+/// on a type which can never be an integer. The message mirrors CPython's own
+/// message from `PyNumber_Index` failures (built from `tp_name`), and is
+/// stored inline in the lazy `PyErr` state without any heap closure.
+#[cfg(not(Py_LIMITED_API))]
+#[cold]
+#[inline(never)]
+fn extract_int_type_error(obj: Borrowed<'_, '_, PyAny>) -> PyErr {
+    // Built by hand (rather than `format!`) to keep the failure path cheap;
+    // the message is byte-identical to CPython's own.
+    const SUFFIX: &str = "' object cannot be interpreted as an integer";
+    let type_name = unsafe { std::ffi::CStr::from_ptr((*ffi::Py_TYPE(obj.as_ptr())).tp_name) }
+        .to_string_lossy();
+    let mut message = String::with_capacity(type_name.len() + SUFFIX.len() + 1);
+    message.push('\'');
+    message.push_str(&type_name);
+    message.push_str(SUFFIX);
+    exceptions::PyTypeError::new_err(message)
+}
+
+#[cfg(Py_LIMITED_API)]
+#[cold]
+#[inline(never)]
+fn extract_int_type_error(obj: Borrowed<'_, '_, PyAny>) -> PyErr {
+    use crate::types::{PyAnyMethods as _, PyStringMethods as _, PyTypeMethods as _};
+    let type_name = obj
+        .get_type()
+        .name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "<unknown>".to_owned());
+    exceptions::PyTypeError::new_err(format!(
+        "'{}' object cannot be interpreted as an integer",
+        type_name
+    ))
+}
+
 macro_rules! nonzero_int_impl {
     ($nonzero_type:ty, $primitive_type:ty) => {
         impl<'py> IntoPyObject<'py> for $nonzero_type {
@@ -830,6 +1002,102 @@ mod test_128bit_integers {
         })
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_extract_int_lazy_type_error() {
+        // A type without `__index__` (and not an `int`) fails lazily; the error
+        // is still a `TypeError` with a message mirroring CPython's
+        // `PyNumber_Index` failure.
+        Python::attach(|py| {
+            let obj = crate::types::PyDict::new(py).into_any();
+            let err = obj.extract::<i64>().unwrap_err();
+            assert!(err.is_instance_of::<crate::exceptions::PyTypeError>(py));
+            assert_eq!(
+                err.to_string(),
+                "TypeError: 'dict' object cannot be interpreted as an integer"
+            );
+        })
+    }
+
+    #[test]
+    fn test_extract_int_lazy_type_error_force_index_call() {
+        // Same for the `force_index_call` family (u64/usize).
+        Python::attach(|py| {
+            let obj = py
+                .eval(c"'not a number'", None, None)
+                .unwrap();
+            let err = obj.extract::<u64>().unwrap_err();
+            assert!(err.is_instance_of::<crate::exceptions::PyTypeError>(py));
+            assert_eq!(
+                err.to_string(),
+                "TypeError: 'str' object cannot be interpreted as an integer"
+            );
+        })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_extract_int_from_index_object() {
+        // Objects defining `__index__` (e.g. numpy scalars) are still accepted.
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                c"class WithIndex:
+    def __index__(self):
+        return 7
+obj = WithIndex()",
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let obj = locals.get_item("obj").unwrap().unwrap();
+            assert_eq!(obj.extract::<i64>().unwrap(), 7);
+            assert_eq!(obj.extract::<u64>().unwrap(), 7);
+        })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_extract_int_index_error_propagates() {
+        // An `__index__` which itself raises keeps propagating the original
+        // error from the interpreter (not the lazy fast-path error).
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                c"class BadIndex:
+    def __index__(self):
+        raise ValueError('boom')
+obj = BadIndex()",
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let obj = locals.get_item("obj").unwrap().unwrap();
+            let err = obj.extract::<i64>().unwrap_err();
+            assert!(err.is_instance_of::<crate::exceptions::PyValueError>(py));
+            let err = obj.extract::<u64>().unwrap_err();
+            assert!(err.is_instance_of::<crate::exceptions::PyValueError>(py));
+        })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_extract_int_from_int_subclass() {
+        // `int` subclasses (incl. `bool`) keep working through the fast path.
+        Python::attach(|py| {
+            let obj = py.eval(c"True", None, None).unwrap();
+            assert_eq!(obj.extract::<i64>().unwrap(), 1);
+            let locals = PyDict::new(py);
+            py.run(
+                c"class MyInt(int):
+    pass
+obj = MyInt(5)",
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let obj = locals.get_item("obj").unwrap().unwrap();
+            assert_eq!(obj.extract::<i64>().unwrap(), 5);
+        })
+    }
+
     #[test]
     fn test_i128_min() {
         Python::attach(|py| {
@@ -987,6 +1255,68 @@ mod tests {
             let obj = v.into_pyobject(py).unwrap();
             assert_eq!(v, obj.extract::<u64>().unwrap());
             assert!(obj.extract::<i64>().is_err());
+        });
+    }
+
+    // D4 characterization: whichever side of `PyLong_AsLong` /
+    // `PyLong_AsLongAndOverflow` the `c_long` family extracts through, the
+    // observable behavior must stay identical. The parity arms call the
+    // interpreter's own `PyLong_AsLong` on the same objects and compare the
+    // resulting error byte-for-byte.
+    #[cfg(all(target_pointer_width = "64", not(target_os = "windows")))]
+    #[test]
+    fn test_extract_c_long_overflow_parity() {
+        Python::attach(|py| {
+            let huge = ((i64::MAX as i128) + 1).into_pyobject(py).unwrap();
+            let tiny = ((i64::MIN as i128) - 1).into_pyobject(py).unwrap();
+
+            // Parity arms: the interpreter's own error for the same input.
+            unsafe { crate::ffi::PyLong_AsLong(huge.as_ptr()) };
+            let huge_cpython = crate::PyErr::take(py).unwrap();
+            unsafe { crate::ffi::PyLong_AsLong(tiny.as_ptr()) };
+            let tiny_cpython = crate::PyErr::take(py).unwrap();
+
+            let err = huge.extract::<i64>().unwrap_err();
+            assert_eq!(err.to_string(), huge_cpython.to_string());
+            assert_eq!(
+                err.to_string(),
+                "OverflowError: Python int too large to convert to C long"
+            );
+            let err = tiny.extract::<i64>().unwrap_err();
+            assert_eq!(err.to_string(), tiny_cpython.to_string());
+            assert_eq!(
+                err.to_string(),
+                "OverflowError: Python int too large to convert to C long"
+            );
+
+            // Boundary values round-trip, and -1 stays a legal success value
+            // (not the error sentinel).
+            let max = i64::MAX.into_pyobject(py).unwrap();
+            assert_eq!(max.extract::<i64>().unwrap(), i64::MAX);
+            let min = i64::MIN.into_pyobject(py).unwrap();
+            assert_eq!(min.extract::<i64>().unwrap(), i64::MIN);
+            let minus_one = (-1i64).into_pyobject(py).unwrap();
+            assert_eq!(minus_one.extract::<i64>().unwrap(), -1);
+        });
+    }
+
+    // Same characterization on platforms where `c_long` is 32 bits: there the
+    // `i32` extraction overflows `c_long` itself before any `try_from` check.
+    #[cfg(any(target_os = "windows", target_pointer_width = "32"))]
+    #[test]
+    fn test_extract_c_long_overflow_parity_narrow_long() {
+        Python::attach(|py| {
+            let huge = (1i64 << 40).into_pyobject(py).unwrap();
+
+            unsafe { crate::ffi::PyLong_AsLong(huge.as_ptr()) };
+            let cpython_err = crate::PyErr::take(py).unwrap();
+
+            let err = huge.extract::<i32>().unwrap_err();
+            assert_eq!(err.to_string(), cpython_err.to_string());
+            assert_eq!(
+                err.to_string(),
+                "OverflowError: Python int too large to convert to C long"
+            );
         });
     }
 

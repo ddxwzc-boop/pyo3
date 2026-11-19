@@ -5,9 +5,9 @@ use crate::inspect::types::TypeInfo;
 use crate::inspect::PyStaticExpr;
 #[cfg(feature = "experimental-inspect")]
 use crate::type_object::PyTypeInfo;
-use crate::{
-    ffi, ffi_ptr_ext::FfiPtrExt, instance::Bound, Borrowed, FromPyObject, PyAny, PyErr, Python,
-};
+#[cfg(not(any(Py_LIMITED_API, PyPy)))]
+use crate::exceptions;
+use crate::{ffi, ffi_ptr_ext::FfiPtrExt, instance::Bound, Borrowed, FromPyObject, PyAny, PyErr, Python};
 use std::convert::Infallible;
 use std::ffi::c_double;
 
@@ -118,32 +118,89 @@ impl<'py> FromPyObject<'_, 'py> for f64 {
     const INPUT_TYPE: PyStaticExpr = PyFloat::TYPE_HINT;
 
     // PyFloat_AsDouble returns -1.0 upon failure
-    #[allow(clippy::float_cmp)]
     fn extract(obj: Borrowed<'_, 'py, PyAny>) -> Result<Self, Self::Error> {
         // On non-limited API, .value() uses PyFloat_AS_DOUBLE which
         // allows us to have an optimized fast path for the case when
         // we have exactly a `float` object (it's not worth going through
         // `isinstance` machinery for subclasses).
+        //
+        // Everything else (subclasses, `__float__` objects, failures) is
+        // delegated to an out-of-line cold function so that this hot path
+        // keeps the same size and shape as the upstream fast path.
         #[cfg(not(Py_LIMITED_API))]
         if let Ok(float) = obj.cast_exact::<PyFloat>() {
             return Ok(float.value());
         }
 
-        let v = unsafe { ffi::PyFloat_AsDouble(obj.as_ptr()) };
-
-        if v == -1.0 {
-            if let Some(err) = PyErr::take(obj.py()) {
-                return Err(err);
-            }
-        }
-
-        Ok(v)
+        extract_float_non_exact(obj)
     }
 
     #[cfg(feature = "experimental-inspect")]
     fn type_input() -> TypeInfo {
         Self::type_output()
     }
+}
+
+/// Cold slow path for float extraction: non-exact objects (subclasses and
+/// anything relying on `__float__`), plus all failure handling. Kept fully
+/// out of line so that the common exact-`float` fast path above compiles to
+/// the same machine code as upstream.
+#[cold]
+#[inline(never)]
+fn extract_float_non_exact(obj: Borrowed<'_, '_, PyAny>) -> Result<f64, PyErr> {
+    // Failure fast-path (mirrors the equivalent check in `extract_int!`):
+    // a type which is neither a `float` (or subclass) nor defines
+    // `__float__` (the `nb_float` slot, which also covers `int`) can never
+    // be converted by `PyFloat_AsDouble`. For such inputs fail lazily
+    // instead of letting the interpreter construct a `TypeError` which
+    // would immediately be fetched again and typically dropped without
+    // ever being observed.
+    #[cfg(not(any(Py_LIMITED_API, PyPy)))]
+    if unsafe { ffi::PyFloat_Check(obj.as_ptr()) } == 0 && !unsafe { has_nb_float(obj.as_ptr()) } {
+        return Err(extract_float_type_error(obj));
+    }
+
+    let v = unsafe { ffi::PyFloat_AsDouble(obj.as_ptr()) };
+
+    #[allow(clippy::float_cmp)]
+    if v == -1.0 {
+        if let Some(err) = PyErr::take(obj.py()) {
+            return Err(err);
+        }
+    }
+
+    Ok(v)
+}
+
+/// Whether the object's type defines the `nb_float` slot (i.e. `__float__`),
+/// which is the only remaining way for a non-`float` object to be accepted
+/// by `PyFloat_AsDouble` (this also covers `int`, which defines `__float__`).
+#[cfg(not(any(Py_LIMITED_API, PyPy)))]
+#[inline(always)]
+unsafe fn has_nb_float(obj: *mut ffi::PyObject) -> bool {
+    // Reads `ob_type` directly (in this crate) so that the check inlines
+    // into the extraction fast path.
+    let tp_as_number = unsafe { (*(*obj).ob_type).tp_as_number };
+    !tp_as_number.is_null() && unsafe { (*tp_as_number).nb_float.is_some() }
+}
+
+/// Constructs the lazy `TypeError` returned when float extraction is
+/// attempted on a type which can never be converted to a `float`. The message
+/// mirrors CPython's own message from `PyFloat_AsDouble` failures (built from
+/// `tp_name`) and is stored inline in the lazy `PyErr` state.
+#[cfg(not(any(Py_LIMITED_API, PyPy)))]
+#[cold]
+#[inline(never)]
+fn extract_float_type_error(obj: Borrowed<'_, '_, PyAny>) -> PyErr {
+    // Built by hand (rather than `format!`) to keep the failure path cheap;
+    // the message is byte-identical to CPython's own.
+    const PREFIX: &str = "must be real number, not ";
+    let type_name = unsafe { std::ffi::CStr::from_ptr((*ffi::Py_TYPE(obj.as_ptr())).tp_name) }
+        .to_string_lossy();
+    let mut message = String::with_capacity(type_name.len() + PREFIX.len());
+    message.push_str(PREFIX);
+    message.push_str(&type_name);
+    exceptions::PyTypeError::new_err(message)
 }
 
 impl<'py> IntoPyObject<'py> for f32 {
@@ -281,9 +338,78 @@ impl_partial_eq_for_float!(f32);
 mod tests {
     use crate::{
         conversion::IntoPyObject,
-        types::{PyAnyMethods, PyFloat, PyFloatMethods},
+        types::{PyAnyMethods, PyDict, PyDictMethods, PyFloat, PyFloatMethods},
         Python,
     };
+
+    #[test]
+    fn test_extract_float_lazy_type_error() {
+        // A type which is neither a `float` nor defines `__float__` fails
+        // lazily; the error is still a `TypeError` with a message mirroring
+        // CPython's `PyFloat_AsDouble` failure.
+        Python::attach(|py| {
+            let obj = py.eval(c"{}", None, None).unwrap();
+            let err = obj.extract::<f64>().unwrap_err();
+            assert!(err.is_instance_of::<crate::exceptions::PyTypeError>(py));
+            assert_eq!(err.to_string(), "TypeError: must be real number, not dict");
+        })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_extract_float_from_int_and_float_subclass() {
+        Python::attach(|py| {
+            let obj = py.eval(c"5", None, None).unwrap();
+            assert_eq!(obj.extract::<f64>().unwrap(), 5.0);
+            let locals = PyDict::new(py);
+            py.run(
+                c"class MyFloat(float):
+    pass
+obj = MyFloat(1.5)",
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let obj = locals.get_item("obj").unwrap().unwrap();
+            assert_eq!(obj.extract::<f64>().unwrap(), 1.5);
+        })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_extract_float_from_dunder_float() {
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                c"class WithFloat:
+    def __float__(self):
+        return 2.5
+obj = WithFloat()",
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let obj = locals.get_item("obj").unwrap().unwrap();
+            assert_eq!(obj.extract::<f64>().unwrap(), 2.5);
+        })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_extract_float_dunder_float_error_propagates() {
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                c"class BadFloat:
+    def __float__(self):
+        raise ValueError('boom')
+obj = BadFloat()",
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+            let obj = locals.get_item("obj").unwrap().unwrap();
+            let err = obj.extract::<f64>().unwrap_err();
+            assert!(err.is_instance_of::<crate::exceptions::PyValueError>(py));
+        })
+    }
 
     macro_rules! num_to_py_object_and_back (
         ($func_name:ident, $t1:ty, $t2:ty) => (
